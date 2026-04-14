@@ -16,6 +16,13 @@ import { SiGithub } from "react-icons/si";
 import { CodeViewer } from "@/components/CodeViewer";
 import { FileTree } from "@/components/FileTree";
 import { FunctionOverviewPanel } from "@/components/FunctionOverviewPanel";
+import {
+  createAnalysisHistoryRecord,
+  createFileTreeFromFileList,
+  flattenFileTreePaths,
+  getAnalysisHistoryRecordById,
+  upsertAnalysisHistoryRecord,
+} from "@/lib/analysisHistory";
 import { stringifyJsonPreview } from "@/lib/jsonPreview";
 import { collectAnalysisCandidatePaths } from "@/lib/repositoryAnalysis";
 import { cn } from "@/lib/utils";
@@ -31,6 +38,7 @@ import {
   type AIModelDebugData,
   type EntryPointReviewAttempt,
   type EntryPointVerificationDebugData,
+  type FunctionCallNode,
   type FunctionCallAnalysisDebugData,
   type FunctionCallOverview,
 } from "@/types/aiAnalysis";
@@ -196,7 +204,39 @@ function summarizeFunctionOverview(overview: FunctionCallOverview | null): strin
     return TEXT.functionOverviewUnavailable;
   }
 
-  return `${TEXT.entryFunction}：${overview.root.name}${TEXT.fullStop}${TEXT.keySubFunctions}：${overview.root.children.length} 个${TEXT.fullStop}`;
+  const queue = [...overview.root.children];
+  let nodeCount = 0;
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+
+    if (!current) {
+      continue;
+    }
+
+    nodeCount += 1;
+    queue.push(...current.children);
+  }
+
+  return `${TEXT.entryFunction}：${overview.root.name}${TEXT.fullStop}递归层级：${overview.analyzedDepth}${TEXT.fullStop}关键节点：${nodeCount} 个${TEXT.fullStop}`;
+}
+
+function collectFunctionDescendants(root: FunctionCallNode, limit = 6): FunctionCallNode[] {
+  const queue = [...root.children];
+  const nodes: FunctionCallNode[] = [];
+
+  while (queue.length > 0 && nodes.length < limit) {
+    const current = queue.shift();
+
+    if (!current) {
+      continue;
+    }
+
+    nodes.push(current);
+    queue.push(...current.children);
+  }
+
+  return nodes;
 }
 
 function getEntryReviewLogLevel(
@@ -469,6 +509,8 @@ function PanelToggleButton({
 function AnalyzePageContent() {
   const searchParams = useSearchParams();
   const autoAnalyzedRepoRef = useRef<string | null>(null);
+  const autoLoadedHistoryRef = useRef<string | null>(null);
+  const shouldPersistHistoryRef = useRef(false);
   const logCounterRef = useRef(0);
   const resizeStateRef = useRef<ResizeState | null>(null);
 
@@ -659,8 +701,45 @@ function AnalyzePageContent() {
     });
   };
 
+  const restoreFromHistory = useEffectEvent((historyId: string): boolean => {
+    const history = getAnalysisHistoryRecordById(historyId);
+    if (!history) {
+      return false;
+    }
+
+    const restoredFileTree = createFileTreeFromFileList(history.fileList);
+    const preferredFilePath =
+      history.analysisResult?.verifiedEntryPoint ??
+      history.analysisResult?.entryPoints[0] ??
+      history.fileList[0] ??
+      "";
+
+    shouldPersistHistoryRef.current = false;
+    setIsLoading(false);
+    setIsAnalyzingAI(false);
+    setError(null);
+    setAiError(null);
+    setUrlInput(history.repositoryUrl);
+    setRepoInfo({
+      owner: history.owner,
+      repo: history.repo,
+      branch: history.branch,
+      repositoryUrl: history.repositoryUrl,
+      description: history.description,
+    });
+    setFileTree(restoredFileTree);
+    setSelectedFilePath(preferredFilePath);
+    setAiAnalysis(history.analysisResult);
+    setWorkLogs(history.workLogs);
+
+    autoAnalyzedRepoRef.current = `${history.owner}/${history.repo}`;
+    return true;
+  });
+
   const analyzeRepository = async (urlToAnalyze: string) => {
     const normalizedUrl = urlToAnalyze.trim();
+    shouldPersistHistoryRef.current = true;
+    autoLoadedHistoryRef.current = null;
     startLogSession(normalizedUrl);
 
     const parsed = parseGitHubUrl(normalizedUrl);
@@ -876,6 +955,17 @@ function AnalyzePageContent() {
   });
 
   useEffect(() => {
+    const historyParam = searchParams.get("history")?.trim();
+
+    if (historyParam && autoLoadedHistoryRef.current !== historyParam) {
+      const restored = restoreFromHistory(historyParam);
+
+      if (restored) {
+        autoLoadedHistoryRef.current = historyParam;
+        return;
+      }
+    }
+
     const repoParam = searchParams.get("repo");
 
     if (!repoParam || autoAnalyzedRepoRef.current === repoParam) {
@@ -890,6 +980,41 @@ function AnalyzePageContent() {
 
     handleAutoAnalyze(normalizedUrl);
   }, [searchParams]);
+
+  const persistCurrentAnalysisHistory = useEffectEvent(() => {
+    if (!shouldPersistHistoryRef.current) {
+      return;
+    }
+
+    if (!repoInfo || isLoading || isAnalyzingAI) {
+      return;
+    }
+
+    const fileList = flattenFileTreePaths(fileTree);
+    if (fileList.length === 0) {
+      return;
+    }
+
+    const historyRecord = createAnalysisHistoryRecord({
+      repoInfo: {
+        owner: repoInfo.owner,
+        repo: repoInfo.repo,
+        branch: repoInfo.branch,
+        repositoryUrl: repoInfo.repositoryUrl,
+        description: repoInfo.description,
+      },
+      fileList,
+      analysisResult: aiAnalysis,
+      workLogs,
+    });
+
+    upsertAnalysisHistoryRecord(historyRecord);
+    shouldPersistHistoryRef.current = false;
+  });
+
+  useEffect(() => {
+    persistCurrentAnalysisHistory();
+  }, [repoInfo, fileTree, aiAnalysis, workLogs, isLoading, isAnalyzingAI]);
 
   const handleAnalyzeClick = () => {
     const normalizedUrl = urlInput.trim();
@@ -1189,23 +1314,25 @@ function AnalyzePageContent() {
                                 aiAnalysis.functionCallOverview,
                               )}
                             </p>
-                            {aiAnalysis.functionCallOverview.root.children.length > 0 && (
+                            {collectFunctionDescendants(
+                              aiAnalysis.functionCallOverview.root,
+                            ).length > 0 && (
                               <ul className="mt-2 space-y-1.5">
-                                {aiAnalysis.functionCallOverview.root.children
-                                  .slice(0, 4)
-                                  .map((child) => (
-                                    <li
-                                      key={`${child.name}-${child.filePath ?? "unknown"}`}
-                                      className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-600 dark:border-gray-800 dark:bg-gray-900/60 dark:text-gray-300"
-                                    >
-                                      <p className="font-mono text-[11px] text-gray-800 dark:text-gray-100">
-                                        {child.name}
-                                      </p>
-                                      <p className="mt-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
-                                        {child.filePath ?? TEXT.unknownFunctionFile}
-                                      </p>
-                                    </li>
-                                  ))}
+                                {collectFunctionDescendants(
+                                  aiAnalysis.functionCallOverview.root,
+                                ).map((child) => (
+                                  <li
+                                    key={`${child.name}-${child.filePath ?? "unknown"}`}
+                                    className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-600 dark:border-gray-800 dark:bg-gray-900/60 dark:text-gray-300"
+                                  >
+                                    <p className="font-mono text-[11px] text-gray-800 dark:text-gray-100">
+                                      {child.name}
+                                    </p>
+                                    <p className="mt-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
+                                      {child.filePath ?? TEXT.unknownFunctionFile}
+                                    </p>
+                                  </li>
+                                ))}
                               </ul>
                             )}
                           </div>

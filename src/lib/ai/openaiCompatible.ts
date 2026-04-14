@@ -6,10 +6,13 @@ import {
   aiAnalysisJsonTemplate,
   entryPointReviewJsonSchema,
   entryPointReviewJsonTemplate,
+  functionCallDrillDownJsonSchema,
+  functionCallDrillDownJsonTemplate,
   functionCallOverviewJsonSchema,
   functionCallOverviewJsonTemplate,
   normalizeAIAnalysisResult,
   normalizeEntryPointReviewResult,
+  normalizeFunctionCallNode,
   normalizeFunctionCallOverview,
   type AIAnalysisResult,
   type AIModelDebugAttempt,
@@ -17,11 +20,21 @@ import {
   type EntryPointReviewAttempt,
   type EntryPointReviewResult,
   type EntryPointVerificationDebugData,
+  type FunctionCallNode,
   type FunctionCallAnalysisDebugData,
   type FunctionCallOverview,
   type RepositoryAnalysisContext,
   type RepositoryAnalysisDebugData,
 } from "@/types/aiAnalysis";
+import {
+  countFunctionTreeNodes,
+  createRankedFunctionSearchPaths,
+  isLikelyNonProjectFunctionName,
+  isSearchableFunctionFile,
+  normalizeFunctionSearchName,
+  searchFunctionDefinitionInFiles,
+  type FunctionDefinitionMatch,
+} from "@/lib/ai/functionCallSearch";
 
 const DEFAULT_REPOSITORY_ANALYSIS_MODEL =
   process.env.OPENAI_COMPAT_MODEL?.trim() || "gpt-5.4";
@@ -32,13 +45,22 @@ const DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL =
   process.env.OPENAI_COMPAT_FUNCTION_MODEL?.trim() ||
   DEFAULT_REPOSITORY_ANALYSIS_MODEL;
 const MAX_ANALYSIS_PATHS = 1000;
+const MAX_LOCATION_GUESS_PROMPT_PATHS = 260;
+const MAX_DRILL_DOWN_PROMPT_PATHS = 260;
 const FILE_DIRECT_READ_LINE_LIMIT = 4000;
 const FILE_SEGMENT_LINE_COUNT = 2000;
 const FUNCTION_ANALYSIS_FILE_DIRECT_READ_LINE_LIMIT = 2000;
 const FUNCTION_ANALYSIS_FILE_SEGMENT_LINE_COUNT = 1000;
+const FUNCTION_SNIPPET_DIRECT_READ_LINE_LIMIT = 300;
+const FUNCTION_SNIPPET_SEGMENT_LINE_COUNT = 150;
 const PROJECT_INTRO_DIRECT_READ_LINE_LIMIT = 300;
 const PROJECT_INTRO_SEGMENT_LINE_COUNT = 150;
 const MAX_KEY_SUB_FUNCTIONS = 20;
+const MAX_FUNCTION_LOCATION_GUESS_PATHS = 6;
+const DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH = parsePositiveIntegerEnv(
+  process.env.OPENAI_COMPAT_FUNCTION_MAX_DEPTH,
+  2,
+);
 
 const TEXT = {
   configMissing:
@@ -141,6 +163,72 @@ const TEXT = {
   functionOverviewSuccessSuffix: " 个关键子函数。",
 } as const;
 
+const functionLocationGuessJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    candidatePaths: {
+      type: "array",
+      maxItems: MAX_FUNCTION_LOCATION_GUESS_PATHS,
+      items: {
+        type: "string",
+      },
+      description:
+        "根据函数名、父函数上下文和仓库文件列表推断出的最可能文件路径，按优先级排序。",
+    },
+    reason: {
+      type: "string",
+      description: "简体中文说明，解释为什么优先猜测这些文件。",
+    },
+  },
+  required: ["candidatePaths", "reason"],
+} as const;
+
+const functionLocationGuessJsonTemplate = `{
+  "candidatePaths": ["src/config/loadConfig.ts"],
+  "reason": "函数名与配置加载职责高度相关，文件名和目录结构都与该函数语义匹配。"
+}`;
+
+const FUNCTION_LOCATION_GUESS_SYSTEM_MESSAGES = [
+  "你是一名资深软件架构师。",
+  "你正在根据函数名、上级调用上下文和仓库文件列表推断函数最可能存在的文件。",
+  "所有自然语言输出必须使用简体中文。",
+  "只返回合法 JSON，不要输出 Markdown 代码块。",
+  "判断要保守；如果无法确认，只返回少量最可能的路径。",
+] as const;
+
+const FUNCTION_LOCATION_GUESS_USER_MESSAGES = [
+  "请根据函数名、父函数信息和仓库文件列表，推断目标函数最可能定义在哪些文件中。",
+  "只返回项目内真实存在的文件路径，按优先级排序，最多返回 6 个。",
+  "如果某个路径只是弱猜测，不要为了凑数量强行返回。",
+  "reason 字段必须使用简体中文简洁说明判断依据。",
+  "请严格按照下面的模板返回 JSON：",
+] as const;
+
+const FUNCTION_DRILL_DOWN_SYSTEM_MESSAGES = [
+  "你是一名资深软件架构师。",
+  "你正在分析某个已定位函数的源码片段，并识别它直接调用的关键子函数。",
+  "所有自然语言输出必须使用简体中文。",
+  "只返回合法 JSON，不要输出 Markdown 代码块。",
+  "只识别当前函数直接调用、且对核心业务链路有明显影响的关键子函数。",
+  "忽略系统函数、标准库函数、第三方库函数、简单包装函数、日志函数、样式拼装和明显非核心的辅助函数。",
+  "children 字段只保留第一层关键子函数，每个子函数的 children 必须返回空数组。",
+  "shouldDive 只能返回 -1、0、1。",
+  "如果当前函数本身已经属于非核心逻辑，可以将 shouldDive 设为 -1，并返回空 children。",
+  "关键子函数数量不能超过 20 个。",
+  "对于仓库内自定义函数，除非能明确判定为系统函数、库函数或明显的收尾工具逻辑，否则不要轻易返回 -1；拿不准时优先返回 0。",
+] as const;
+
+const FUNCTION_DRILL_DOWN_USER_MESSAGES = [
+  "请基于当前函数的源码片段，识别它直接调用的关键子函数。",
+  "name 和 filePath 字段表示当前正在分析的函数本身，请保守填写。",
+  "children 中的每个子函数都要给出最可能的定义文件路径；无法判断时返回 null。",
+  "summary 字段必须是简体中文的简洁功能说明。",
+  "如果子函数明显属于系统函数、第三方库函数或非关键逻辑，请不要放入 children。",
+  "如果某个仓库内自定义函数是否值得继续下钻无法确定，shouldDive 优先返回 0，而不是直接返回 -1。",
+  "请严格按照下面的模板返回 JSON：",
+] as const;
+
 type OpenAIMessage = {
   role: "system" | "user";
   content: string;
@@ -202,6 +290,131 @@ type FunctionOverviewOutcome = {
   result: FunctionCallOverview | null;
   debug: FunctionCallAnalysisDebugData;
 };
+
+type FunctionLocationGuessResult = {
+  candidatePaths: string[];
+  reason: string;
+};
+
+type FunctionLocationAttempt = {
+  strategy: "same_file" | "ai_guess" | "project_search";
+  candidatePaths: string[];
+  matchedFilePath: string | null;
+  matchedLine: number | null;
+  reason: string;
+};
+
+type FunctionDrillDownContext = {
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  promptFilePaths: string[];
+  searchFilePaths: string[];
+  projectIntroduction: ProjectIntroductionExcerpt;
+  loadFileContent: (path: string) => Promise<string>;
+  maxDepth: number;
+  visitedNodeKeys: Set<string>;
+};
+
+type FunctionDrillDownResult = {
+  node: FunctionCallNode;
+  analyzedDepth: number;
+};
+
+const CLEAR_STOP_DIVE_NAME_PATTERNS = [
+  /^(?:render|format|log|debug|trace|print|stringify|compare|assert|validate|normalize|sanitize|trim|sleep|delay|retry)/i,
+  /^(?:is|has|get|set|to|from)[A-Z]/,
+] as const;
+
+const CLEAR_STOP_DIVE_SUMMARY_PATTERNS = [
+  /日志|埋点|样式|格式化|转换|映射|比较|校验|断言|常量|枚举|拼接|展示|渲染|包装|封装/,
+] as const;
+
+function parsePositiveIntegerEnv(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function isClearlyStopDiveNode(node: FunctionCallNode): boolean {
+  if (!node.filePath) {
+    return true;
+  }
+
+  return (
+    CLEAR_STOP_DIVE_NAME_PATTERNS.some((pattern) => pattern.test(node.name)) ||
+    CLEAR_STOP_DIVE_SUMMARY_PATTERNS.some((pattern) =>
+      pattern.test(node.summary),
+    )
+  );
+}
+
+function buildDrillDownVisitKey(
+  node: Pick<FunctionCallNode, "name" | "filePath">,
+): string {
+  const normalizedName =
+    normalizeFunctionSearchName(node.name)?.toLowerCase() ||
+    node.name.trim().toLowerCase();
+  const normalizedPath = node.filePath?.trim().toLowerCase() || "__unknown__";
+
+  return `${normalizedPath}::${normalizedName}`;
+}
+
+function markNodeAsStopped(
+  node: FunctionCallNode,
+  filePath?: string | null,
+): FunctionCallNode {
+  return {
+    ...node,
+    filePath: filePath ?? node.filePath,
+    shouldDive: -1,
+    children: [],
+  };
+}
+
+function shouldStopDrillDownNode(args: {
+  node: FunctionCallNode;
+  depth: number;
+  context: FunctionDrillDownContext;
+}): boolean {
+  const { node, depth, context } = args;
+
+  if (depth > context.maxDepth || node.shouldDive === -1) {
+    return true;
+  }
+
+  if (!normalizeFunctionSearchName(node.name)) {
+    return true;
+  }
+
+  if (!node.filePath && isLikelyNonProjectFunctionName(node.name)) {
+    return true;
+  }
+
+  if (
+    node.filePath &&
+    !context.searchFilePaths.includes(node.filePath) &&
+    isLikelyNonProjectFunctionName(node.name)
+  ) {
+    return true;
+  }
+
+  if (node.shouldDive !== 1 && isClearlyStopDiveNode(node) && !node.filePath) {
+    return true;
+  }
+
+  return false;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -368,6 +581,170 @@ function buildFunctionOverviewMessages(args: {
         `${TEXT.truncated}${entryExcerpt.truncated ? TEXT.yes : TEXT.no}`,
         TEXT.entryFileContent,
         entryExcerpt.content,
+        TEXT.repoPathsIntro,
+        ...filePaths.map((path) => `- ${path}`),
+      ].join("\n"),
+    },
+  ];
+}
+
+function buildProjectIntroductionLines(
+  projectIntroduction: ProjectIntroductionExcerpt,
+): string[] {
+  return projectIntroduction.excerpt
+    ? [
+        `${TEXT.projectIntroductionFile}${
+          projectIntroduction.path ?? TEXT.noDescription
+        }`,
+        `${TEXT.totalLines}${projectIntroduction.excerpt.totalLines}`,
+        `${TEXT.analyzedLines}${projectIntroduction.excerpt.analyzedLines}`,
+        `${TEXT.truncated}${
+          projectIntroduction.excerpt.truncated ? TEXT.yes : TEXT.no
+        }`,
+        TEXT.projectIntroduction,
+        projectIntroduction.excerpt.content,
+      ]
+    : [TEXT.projectIntroductionUnavailable];
+}
+
+function normalizeFunctionLocationGuessResult(
+  value: unknown,
+): FunctionLocationGuessResult {
+  if (!value || typeof value !== "object") {
+    throw new Error("函数文件定位结果必须是 JSON 对象。");
+  }
+
+  const result = value as Record<string, unknown>;
+
+  if (!Array.isArray(result.candidatePaths)) {
+    throw new Error("函数文件定位结果字段 candidatePaths 必须是数组。");
+  }
+
+  if (typeof result.reason !== "string" || !result.reason.trim()) {
+    throw new Error("函数文件定位结果字段 reason 必须是非空字符串。");
+  }
+
+  return {
+    candidatePaths: Array.from(
+      new Set(
+        result.candidatePaths
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean),
+      ),
+    ).slice(0, MAX_FUNCTION_LOCATION_GUESS_PATHS),
+    reason: result.reason.trim(),
+  };
+}
+
+function buildFunctionLocationGuessMessages(args: {
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  functionName: string;
+  parentFunctionName: string;
+  parentFilePath: string | null;
+  hintedFilePath: string | null;
+  filePaths: string[];
+}): OpenAIMessage[] {
+  const {
+    repositoryContext,
+    analysisResult,
+    functionName,
+    parentFunctionName,
+    parentFilePath,
+    hintedFilePath,
+    filePaths,
+  } = args;
+
+  return [
+    {
+      role: "system",
+      content: FUNCTION_LOCATION_GUESS_SYSTEM_MESSAGES.join(" "),
+    },
+    {
+      role: "user",
+      content: [
+        ...FUNCTION_LOCATION_GUESS_USER_MESSAGES,
+        functionLocationGuessJsonTemplate,
+        TEXT.schemaIntro,
+        JSON.stringify(functionLocationGuessJsonSchema),
+        `${TEXT.repositoryUrl}${repositoryContext.repositoryUrl}`,
+        `${TEXT.repositoryDescription}${
+          repositoryContext.repositoryDescription?.trim() || TEXT.noDescription
+        }`,
+        `${TEXT.repositorySummary}${analysisResult.summary || TEXT.noSummary}`,
+        `目标函数：${functionName}`,
+        `上级函数：${parentFunctionName}`,
+        `上级函数所在文件：${parentFilePath ?? TEXT.noDescription}`,
+        `已有候选文件提示：${hintedFilePath ?? TEXT.noDescription}`,
+        TEXT.repoPathsIntro,
+        ...filePaths.map((path) => `- ${path}`),
+      ].join("\n"),
+    },
+  ];
+}
+
+function buildFunctionDrillDownMessages(args: {
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  targetFunction: FunctionCallNode;
+  parentFunctionName: string;
+  callPath: string[];
+  location: FunctionDefinitionMatch;
+  snippetExcerpt: PreparedFileExcerpt;
+  projectIntroduction: ProjectIntroductionExcerpt;
+  filePaths: string[];
+}): OpenAIMessage[] {
+  const {
+    repositoryContext,
+    analysisResult,
+    targetFunction,
+    parentFunctionName,
+    callPath,
+    location,
+    snippetExcerpt,
+    projectIntroduction,
+    filePaths,
+  } = args;
+
+  return [
+    {
+      role: "system",
+      content: FUNCTION_DRILL_DOWN_SYSTEM_MESSAGES.join(" "),
+    },
+    {
+      role: "user",
+      content: [
+        ...FUNCTION_DRILL_DOWN_USER_MESSAGES,
+        functionCallDrillDownJsonTemplate,
+        TEXT.schemaIntro,
+        JSON.stringify(functionCallDrillDownJsonSchema),
+        `${TEXT.repositoryUrl}${repositoryContext.repositoryUrl}`,
+        `${TEXT.repositoryDescription}${
+          repositoryContext.repositoryDescription?.trim() || TEXT.noDescription
+        }`,
+        `${TEXT.repositorySummary}${analysisResult.summary || TEXT.noSummary}`,
+        `${TEXT.primaryLanguages}${
+          analysisResult.primaryLanguages.join("、") || TEXT.noLanguages
+        }`,
+        `${TEXT.techStack}${
+          analysisResult.techStack.join("、") || TEXT.noTechStack
+        }`,
+        `${TEXT.verifiedEntryPoint}${
+          analysisResult.verifiedEntryPoint ?? TEXT.noDescription
+        }`,
+        `调用路径：${callPath.join(" -> ")}`,
+        ...buildProjectIntroductionLines(projectIntroduction),
+        `当前函数：${targetFunction.name}`,
+        `上级函数：${parentFunctionName}`,
+        `函数定义文件：${location.filePath}`,
+        `函数起始行：${location.line}`,
+        `${TEXT.totalLines}${location.totalLines}`,
+        `提取到的函数片段行数：${location.extractedLines}`,
+        `${TEXT.analyzedLines}${snippetExcerpt.analyzedLines}`,
+        `${TEXT.truncated}${snippetExcerpt.truncated ? TEXT.yes : TEXT.no}`,
+        "函数代码片段：",
+        snippetExcerpt.content,
         TEXT.repoPathsIntro,
         ...filePaths.map((path) => `- ${path}`),
       ].join("\n"),
@@ -704,6 +1081,358 @@ async function requestJsonCompletion<T>({
   }
 }
 
+function createCachedFileContentLoader(
+  repositoryContext: RepositoryAnalysisContext,
+): (path: string) => Promise<string> {
+  const cache = new Map<string, Promise<string>>();
+
+  return (path: string) => {
+    const cached = cache.get(path);
+
+    if (cached) {
+      return cached;
+    }
+
+    const request = getFileContent(
+      repositoryContext.owner,
+      repositoryContext.repo,
+      repositoryContext.branch,
+      path,
+    ).catch((error) => {
+      cache.delete(path);
+      throw error;
+    });
+
+    cache.set(path, request);
+    return request;
+  };
+}
+
+function buildLocationGuessPromptPaths(args: {
+  filePaths: string[];
+  functionName: string;
+  parentFilePath: string | null;
+  hintedFilePath: string | null;
+}): string[] {
+  return createRankedFunctionSearchPaths({
+    filePaths: args.filePaths,
+    functionName: args.functionName,
+    parentFilePath: args.parentFilePath,
+    hintedFilePath: args.hintedFilePath,
+  }).slice(0, MAX_LOCATION_GUESS_PROMPT_PATHS);
+}
+
+function buildDrillDownPromptPaths(args: {
+  node: FunctionCallNode;
+  parentFilePath: string | null;
+  resolvedFilePath: string;
+  context: FunctionDrillDownContext;
+}): string[] {
+  const rankedPaths = createRankedFunctionSearchPaths({
+    filePaths: args.context.searchFilePaths,
+    functionName: args.node.name,
+    parentFilePath: args.parentFilePath,
+    hintedFilePath: args.resolvedFilePath,
+  });
+
+  return Array.from(
+    new Set(
+      [
+        args.resolvedFilePath,
+        args.parentFilePath,
+        ...rankedPaths,
+        ...args.context.promptFilePaths,
+      ].filter((path): path is string => Boolean(path)),
+    ),
+  ).slice(0, MAX_DRILL_DOWN_PROMPT_PATHS);
+}
+
+async function locateFunctionDefinition(args: {
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  functionName: string;
+  parentFunctionName: string;
+  parentFilePath: string | null;
+  hintedFilePath: string | null;
+  promptFilePaths: string[];
+  searchFilePaths: string[];
+  loadFileContent: (path: string) => Promise<string>;
+}): Promise<{
+  location: FunctionDefinitionMatch | null;
+  attempts: FunctionLocationAttempt[];
+}> {
+  const attempts: FunctionLocationAttempt[] = [];
+  const searchablePaths = args.searchFilePaths.filter((path) =>
+    isSearchableFunctionFile(path),
+  );
+  const promptSearchablePaths = buildLocationGuessPromptPaths({
+    filePaths: searchablePaths,
+    functionName: args.functionName,
+    parentFilePath: args.parentFilePath,
+    hintedFilePath: args.hintedFilePath,
+  });
+  const availableSearchablePaths = new Set(searchablePaths);
+
+  if (
+    args.parentFilePath &&
+    availableSearchablePaths.has(args.parentFilePath)
+  ) {
+    const sameFileMatch = await searchFunctionDefinitionInFiles({
+      filePaths: [args.parentFilePath],
+      loadFileContent: args.loadFileContent,
+      functionName: args.functionName,
+      strategy: "same_file",
+    });
+
+    attempts.push({
+      strategy: "same_file",
+      candidatePaths: [args.parentFilePath],
+      matchedFilePath: sameFileMatch?.filePath ?? null,
+      matchedLine: sameFileMatch?.line ?? null,
+      reason: sameFileMatch
+        ? "已在上级函数所在文件中定位到定义。"
+        : "未在上级函数同文件中定位到目标函数定义。",
+    });
+
+    if (sameFileMatch) {
+      return {
+        location: sameFileMatch,
+        attempts,
+      };
+    }
+  }
+
+  const hintedCandidatePath =
+    args.hintedFilePath && availableSearchablePaths.has(args.hintedFilePath)
+      ? args.hintedFilePath
+      : null;
+  let guessedPaths: string[] = hintedCandidatePath ? [hintedCandidatePath] : [];
+  let guessReason = hintedCandidatePath
+    ? "沿用上一轮分析给出的候选文件提示。"
+    : "尚无可用的候选文件提示。";
+
+  try {
+    const guessed = await requestJsonCompletion<FunctionLocationGuessResult>({
+      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+      messages: buildFunctionLocationGuessMessages({
+        repositoryContext: args.repositoryContext,
+        analysisResult: args.analysisResult,
+        functionName: args.functionName,
+        parentFunctionName: args.parentFunctionName,
+        parentFilePath: args.parentFilePath,
+        hintedFilePath: args.hintedFilePath,
+        filePaths: promptSearchablePaths,
+      }),
+      schemaName: "function_location_guess",
+      schema: functionLocationGuessJsonSchema as Record<string, unknown>,
+      normalize: normalizeFunctionLocationGuessResult,
+    });
+
+    guessedPaths = Array.from(
+      new Set(
+        [
+          ...(hintedCandidatePath ? [hintedCandidatePath] : []),
+          ...guessed.result.candidatePaths,
+        ].filter((path) => availableSearchablePaths.has(path)),
+      ),
+    );
+    guessReason = guessed.result.reason;
+  } catch (error) {
+    if (error instanceof AIModelInvocationError) {
+      guessReason = `AI 未能完成候选文件推断：${error.message}`;
+    } else {
+      throw error;
+    }
+  }
+
+  if (guessedPaths.length > 0) {
+    const guessedMatch = await searchFunctionDefinitionInFiles({
+      filePaths: guessedPaths,
+      loadFileContent: args.loadFileContent,
+      functionName: args.functionName,
+      strategy: "ai_guess",
+    });
+
+    attempts.push({
+      strategy: "ai_guess",
+      candidatePaths: guessedPaths,
+      matchedFilePath: guessedMatch?.filePath ?? null,
+      matchedLine: guessedMatch?.line ?? null,
+      reason: guessedMatch
+        ? `根据 AI 推断的候选文件成功定位函数。${guessReason}`
+        : `AI 推断的候选文件中未找到目标函数定义。${guessReason}`,
+    });
+
+    if (guessedMatch) {
+      return {
+        location: guessedMatch,
+        attempts,
+      };
+    }
+  } else {
+    attempts.push({
+      strategy: "ai_guess",
+      candidatePaths: [],
+      matchedFilePath: null,
+      matchedLine: null,
+      reason: guessReason,
+    });
+  }
+
+  const projectSearchPaths = createRankedFunctionSearchPaths({
+    filePaths: searchablePaths,
+    functionName: args.functionName,
+    parentFilePath: args.parentFilePath,
+    hintedFilePath: args.hintedFilePath,
+  });
+  const projectSearchMatch = await searchFunctionDefinitionInFiles({
+    filePaths: projectSearchPaths,
+    loadFileContent: args.loadFileContent,
+    functionName: args.functionName,
+    strategy: "project_search",
+  });
+
+  attempts.push({
+    strategy: "project_search",
+    candidatePaths: projectSearchPaths,
+    matchedFilePath: projectSearchMatch?.filePath ?? null,
+    matchedLine: projectSearchMatch?.line ?? null,
+    reason: projectSearchMatch
+      ? "已通过项目级正则搜索定位到目标函数定义。"
+      : "项目级正则搜索未找到目标函数定义。",
+  });
+
+  return {
+    location: projectSearchMatch,
+    attempts,
+  };
+}
+
+async function drillDownFunctionNode(args: {
+  node: FunctionCallNode;
+  parentFunctionName: string;
+  parentFilePath: string | null;
+  callPath: string[];
+  depth: number;
+  context: FunctionDrillDownContext;
+}): Promise<FunctionDrillDownResult> {
+  const { node, parentFunctionName, parentFilePath, callPath, depth, context } =
+    args;
+
+  if (shouldStopDrillDownNode({ node, depth, context })) {
+    return {
+      node: markNodeAsStopped(node),
+      analyzedDepth: Math.min(depth - 1, context.maxDepth),
+    };
+  }
+
+  const visitKey = buildDrillDownVisitKey(node);
+  if (context.visitedNodeKeys.has(visitKey)) {
+    return {
+      node: markNodeAsStopped(node),
+      analyzedDepth: Math.min(depth - 1, context.maxDepth),
+    };
+  }
+  context.visitedNodeKeys.add(visitKey);
+
+  const located = await locateFunctionDefinition({
+    repositoryContext: context.repositoryContext,
+    analysisResult: context.analysisResult,
+    functionName: node.name,
+    parentFunctionName,
+    parentFilePath,
+    hintedFilePath: node.filePath,
+    promptFilePaths: context.promptFilePaths,
+    searchFilePaths: context.searchFilePaths,
+    loadFileContent: context.loadFileContent,
+  });
+
+  if (!located.location) {
+    return {
+      node: markNodeAsStopped(node),
+      analyzedDepth: depth,
+    };
+  }
+
+  const snippetExcerpt = prepareFileExcerpt(located.location.snippet, {
+    directLineLimit: FUNCTION_SNIPPET_DIRECT_READ_LINE_LIMIT,
+    segmentLineCount: FUNCTION_SNIPPET_SEGMENT_LINE_COUNT,
+  });
+  const drillDownPromptPaths = buildDrillDownPromptPaths({
+    node,
+    parentFilePath,
+    resolvedFilePath: located.location.filePath,
+    context,
+  });
+
+  try {
+    const drillDown = await requestJsonCompletion<FunctionCallNode>({
+      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+      messages: buildFunctionDrillDownMessages({
+        repositoryContext: context.repositoryContext,
+        analysisResult: context.analysisResult,
+        targetFunction: node,
+        parentFunctionName,
+        callPath,
+        location: located.location,
+        snippetExcerpt,
+        projectIntroduction: context.projectIntroduction,
+        filePaths: drillDownPromptPaths,
+      }),
+      schemaName: "function_call_drill_down",
+      schema: functionCallDrillDownJsonSchema as Record<string, unknown>,
+      normalize: normalizeFunctionCallNode,
+    });
+
+    const normalizedNode: FunctionCallNode = {
+      ...drillDown.result,
+      name: node.name,
+      filePath: located.location.filePath,
+      children: drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+    };
+
+    if (normalizedNode.shouldDive === -1 || normalizedNode.children.length === 0) {
+      return {
+        node: markNodeAsStopped(normalizedNode, located.location.filePath),
+        analyzedDepth: depth,
+      };
+    }
+
+    const resolvedChildren: FunctionCallNode[] = [];
+    let analyzedDepth = depth;
+
+    for (const child of normalizedNode.children) {
+      const childResult = await drillDownFunctionNode({
+        node: child,
+        parentFunctionName: normalizedNode.name,
+        parentFilePath: located.location.filePath,
+        callPath: [...callPath, child.name],
+        depth: depth + 1,
+        context,
+      });
+      resolvedChildren.push(childResult.node);
+      analyzedDepth = Math.max(analyzedDepth, childResult.analyzedDepth);
+    }
+
+    return {
+      node: {
+        ...normalizedNode,
+        children: resolvedChildren,
+      },
+      analyzedDepth,
+    };
+  } catch (error) {
+    if (error instanceof AIModelInvocationError) {
+      return {
+        node: markNodeAsStopped(node, located.location.filePath),
+        analyzedDepth: depth,
+      };
+    }
+
+    throw error;
+  }
+}
+
 async function loadProjectIntroductionExcerpt(args: {
   repositoryContext: RepositoryAnalysisContext;
   filePaths: string[];
@@ -866,11 +1595,13 @@ async function analyzeFunctionOverview(args: {
   filePaths: string[];
 }): Promise<FunctionOverviewOutcome> {
   const { repositoryContext, analysisResult, filePaths } = args;
+  const promptFilePaths = filePaths.slice(0, MAX_ANALYSIS_PATHS);
   const verifiedEntryPoint = analysisResult.verifiedEntryPoint;
   const projectIntroduction = await loadProjectIntroductionExcerpt({
     repositoryContext,
     filePaths,
   });
+  const loadFileContent = createCachedFileContentLoader(repositoryContext);
 
   if (!verifiedEntryPoint) {
     return {
@@ -888,12 +1619,7 @@ async function analyzeFunctionOverview(args: {
   let entryExcerpt: PreparedFileExcerpt;
 
   try {
-    const entryContent = await getFileContent(
-      repositoryContext.owner,
-      repositoryContext.repo,
-      repositoryContext.branch,
-      verifiedEntryPoint,
-    );
+    const entryContent = await loadFileContent(verifiedEntryPoint);
     entryExcerpt = prepareFileExcerpt(entryContent, {
       directLineLimit: FUNCTION_ANALYSIS_FILE_DIRECT_READ_LINE_LIMIT,
       segmentLineCount: FUNCTION_ANALYSIS_FILE_SEGMENT_LINE_COUNT,
@@ -922,7 +1648,7 @@ async function analyzeFunctionOverview(args: {
         verifiedEntryPoint,
         entryExcerpt,
         projectIntroduction,
-        filePaths,
+        filePaths: promptFilePaths,
       }),
       schemaName: "function_call_overview",
       schema: functionCallOverviewJsonSchema as Record<string, unknown>,
@@ -943,13 +1669,43 @@ async function analyzeFunctionOverview(args: {
     }
 
     const rootNode = overview.result.root;
+    const normalizedRootNode: FunctionCallNode = {
+      ...rootNode,
+      filePath: verifiedEntryPoint,
+      shouldDive: 1,
+      children: rootNode.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+    };
+    const resolvedChildren: FunctionCallNode[] = [];
+    let analyzedDepth = overview.result.analyzedDepth;
+    const drillDownContext: FunctionDrillDownContext = {
+      repositoryContext,
+      analysisResult,
+      promptFilePaths,
+      searchFilePaths: filePaths,
+      projectIntroduction,
+      loadFileContent,
+      maxDepth: DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH,
+      visitedNodeKeys: new Set<string>(),
+    };
+
+    for (const child of normalizedRootNode.children) {
+      const childResult = await drillDownFunctionNode({
+        node: child,
+        parentFunctionName: normalizedRootNode.name,
+        parentFilePath: verifiedEntryPoint,
+        callPath: [normalizedRootNode.name, child.name],
+        depth: 1,
+        context: drillDownContext,
+      });
+      resolvedChildren.push(childResult.node);
+      analyzedDepth = Math.max(analyzedDepth, childResult.analyzedDepth);
+    }
+
     const normalizedResult: FunctionCallOverview = {
-      ...overview.result,
+      analyzedDepth,
       root: {
-        ...rootNode,
-        filePath: verifiedEntryPoint,
-        shouldDive: 1,
-        children: rootNode.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+        ...normalizedRootNode,
+        children: resolvedChildren,
       },
     };
 
@@ -959,9 +1715,11 @@ async function analyzeFunctionOverview(args: {
         targetEntryPoint: verifiedEntryPoint,
         readmePath: projectIntroduction.path,
         status: "completed",
-        message: `${TEXT.functionOverviewSuccessPrefix}${
-          normalizedResult.root ? normalizedResult.root.children.length : 0
-        }${TEXT.functionOverviewSuccessSuffix}`,
+        message: `已完成函数调用链递归分析，共识别 ${
+          normalizedResult.root
+            ? countFunctionTreeNodes(normalizedResult.root) - 1
+            : 0
+        } 个非根节点，最大下钻层级 ${normalizedResult.analyzedDepth}，配置上限 ${DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH}。`,
         model: overview.debug,
       },
     };
@@ -1038,7 +1796,7 @@ export async function analyzeRepository(args: {
   const functionOverview = await analyzeFunctionOverview({
     repositoryContext,
     analysisResult: baseAnalysisResult,
-    filePaths: samplePaths,
+    filePaths,
   });
 
   return {

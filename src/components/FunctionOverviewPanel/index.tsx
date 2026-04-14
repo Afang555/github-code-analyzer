@@ -6,20 +6,20 @@ import { GitBranch, Minus, Move, Plus, RotateCcw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { FunctionCallNode, FunctionCallOverview } from "@/types/aiAnalysis";
 
-const CARD_WIDTH = 260;
-const CARD_HEIGHT = 128;
-const NODE_INDENT = 72;
-const CHILDREN_GAP = 32;
-const ROOT_CHILDREN_GAP = 64;
+const CARD_WIDTH = 272;
+const CARD_HEIGHT = 136;
+const COLUMN_GAP = 128;
+const VERTICAL_GAP = 28;
 const SCENE_PADDING = 40;
-const MIN_SCALE = 0.55;
+const ELBOW_OFFSET = 42;
+const MIN_SCALE = 0.45;
 const MAX_SCALE = 1.8;
 
 const TEXT = {
   title: "函数全景图",
-  subtitle: "展示入口函数及关键子函数",
+  subtitle: "展示入口函数及递归下钻后的关键调用链",
   loading: "正在生成函数调用全景图...",
-  empty: "完成入口识别后，这里会展示入口函数及其关键子函数。",
+  empty: "完成入口识别后，这里会展示入口函数及其递归调用链。",
   zoomIn: "放大",
   zoomOut: "缩小",
   reset: "重置视图",
@@ -39,15 +39,33 @@ type ViewTransform = {
 type LayoutNode = {
   id: string;
   node: FunctionCallNode;
+  depth: number;
   x: number;
   y: number;
 };
 
+type LayoutEdge = {
+  id: string;
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+};
+
+type SubtreeLayout = {
+  nodes: LayoutNode[];
+  edges: LayoutEdge[];
+  height: number;
+  rootX: number;
+  rootY: number;
+  maxX: number;
+};
+
 type LayoutResult = {
   nodes: LayoutNode[];
+  edges: LayoutEdge[];
   width: number;
   height: number;
-  connectorX: number;
 };
 
 function getDiveBadge(node: FunctionCallNode) {
@@ -74,37 +92,115 @@ function getDiveBadge(node: FunctionCallNode) {
   };
 }
 
-function createLayout(root: FunctionCallNode): LayoutResult {
-  const x = SCENE_PADDING + NODE_INDENT;
-  const nodes: LayoutNode[] = [
-    {
-      id: "root",
-      node: root,
-      x,
-      y: SCENE_PADDING,
-    },
-  ];
-  let nextY = SCENE_PADDING + CARD_HEIGHT;
+function shiftSubtree(
+  layout: SubtreeLayout,
+  offsetY: number,
+): SubtreeLayout {
+  return {
+    ...layout,
+    nodes: layout.nodes.map((node) => ({
+      ...node,
+      y: node.y + offsetY,
+    })),
+    edges: layout.edges.map((edge) => ({
+      ...edge,
+      fromY: edge.fromY + offsetY,
+      toY: edge.toY + offsetY,
+    })),
+    rootY: layout.rootY + offsetY,
+  };
+}
 
-  if (root.children.length > 0) {
-    nextY += ROOT_CHILDREN_GAP;
+function layoutSubtree(
+  node: FunctionCallNode,
+  depth: number,
+  id: string,
+): SubtreeLayout {
+  const x = SCENE_PADDING + depth * (CARD_WIDTH + COLUMN_GAP);
+
+  if (node.children.length === 0) {
+    return {
+      nodes: [
+        {
+          id,
+          node,
+          depth,
+          x,
+          y: 0,
+        },
+      ],
+      edges: [],
+      height: CARD_HEIGHT,
+      rootX: x,
+      rootY: CARD_HEIGHT / 2,
+      maxX: x + CARD_WIDTH,
+    };
   }
 
-  root.children.forEach((child, index) => {
-    nodes.push({
-      id: `root-${index}`,
-      node: child,
+  const childLayouts = node.children.map((child, index) =>
+    layoutSubtree(child, depth + 1, `${id}-${index}`),
+  );
+  const childrenHeight =
+    childLayouts.reduce((total, childLayout) => total + childLayout.height, 0) +
+    VERTICAL_GAP * Math.max(childLayouts.length - 1, 0);
+  const height = Math.max(CARD_HEIGHT, childrenHeight);
+  const childBlockOffset = (height - childrenHeight) / 2;
+  const rootY = height / 2;
+  const rootTop = rootY - CARD_HEIGHT / 2;
+
+  const nodes: LayoutNode[] = [
+    {
+      id,
+      node,
+      depth,
       x,
-      y: nextY,
+      y: rootTop,
+    },
+  ];
+  const edges: LayoutEdge[] = [];
+  let currentChildY = childBlockOffset;
+  let maxX = x + CARD_WIDTH;
+
+  for (const childLayout of childLayouts) {
+    const shiftedChildLayout = shiftSubtree(childLayout, currentChildY);
+    nodes.push(...shiftedChildLayout.nodes);
+    edges.push(...shiftedChildLayout.edges);
+    edges.push({
+      id: `${id}->${shiftedChildLayout.nodes[0]?.id ?? currentChildY}`,
+      fromX: x + CARD_WIDTH,
+      fromY: rootY,
+      toX: shiftedChildLayout.rootX,
+      toY: shiftedChildLayout.rootY,
     });
-    nextY += CARD_HEIGHT + CHILDREN_GAP;
-  });
+    currentChildY += childLayout.height + VERTICAL_GAP;
+    maxX = Math.max(maxX, shiftedChildLayout.maxX);
+  }
 
   return {
     nodes,
-    width: x + CARD_WIDTH + SCENE_PADDING,
-    height: (nodes[nodes.length - 1]?.y ?? SCENE_PADDING) + CARD_HEIGHT + SCENE_PADDING,
-    connectorX: SCENE_PADDING + 26,
+    edges,
+    height,
+    rootX: x,
+    rootY,
+    maxX,
+  };
+}
+
+function createLayout(root: FunctionCallNode): LayoutResult {
+  const subtree = layoutSubtree(root, 0, "root");
+
+  return {
+    nodes: subtree.nodes.map((node) => ({
+      ...node,
+      y: node.y + SCENE_PADDING,
+    })),
+    edges: subtree.edges.map((edge) => ({
+      ...edge,
+      fromY: edge.fromY + SCENE_PADDING,
+      toY: edge.toY + SCENE_PADDING,
+    })),
+    width: subtree.maxX + SCENE_PADDING,
+    height: subtree.height + SCENE_PADDING * 2,
   };
 }
 
@@ -112,17 +208,28 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
+function countNodes(node: FunctionCallNode): number {
+  return node.children.reduce((count, child) => count + countNodes(child), 1);
+}
+
+function createOverviewSignature(root: FunctionCallNode): string {
+  return `${root.name}-${root.filePath ?? "unknown"}-${countNodes(root)}`;
+}
+
 function FunctionNodeCard({
   node,
+  depth,
   isSelected,
   onSelectFile,
 }: {
   node: FunctionCallNode;
+  depth: number;
   isSelected: boolean;
   onSelectFile?: (path: string) => void;
 }) {
   const badge = getDiveBadge(node);
   const canOpenFile = Boolean(node.filePath);
+  const isRoot = depth === 0;
 
   return (
     <button
@@ -135,30 +242,40 @@ function FunctionNodeCard({
       }}
       disabled={!canOpenFile}
       className={cn(
-        "flex h-[128px] w-[260px] flex-col overflow-hidden rounded-[26px] border-2 border-slate-900 bg-white text-left shadow-[0_18px_38px_rgba(15,23,42,0.12)] transition-transform dark:border-slate-100 dark:bg-[#191c22]",
+        "flex h-[136px] w-[272px] flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left shadow-[0_10px_24px_rgba(15,23,42,0.12)] transition-transform dark:border-slate-100 dark:bg-[#191c22]",
         canOpenFile && "cursor-pointer hover:-translate-y-0.5",
         !canOpenFile && "cursor-default",
+        isRoot &&
+          "border-blue-700 shadow-[0_14px_26px_rgba(29,78,216,0.18)] dark:border-blue-300",
         isSelected &&
           "ring-4 ring-blue-200/70 dark:border-blue-300 dark:ring-blue-500/30",
       )}
     >
-      <div className="border-b-2 border-slate-900 px-4 py-2 text-[11px] font-medium tracking-wide text-slate-500 dark:border-slate-100 dark:text-slate-400">
+      <div
+        className={cn(
+          "border-b-2 border-slate-900 px-4 py-2 text-[11px] font-medium tracking-wide text-slate-500 dark:border-slate-100 dark:text-slate-400",
+          isRoot && "border-blue-700 bg-blue-50/60 text-blue-700 dark:border-blue-300 dark:bg-blue-950/30 dark:text-blue-300",
+        )}
+      >
         <span className="block truncate" title={node.filePath ?? TEXT.noFile}>
           {node.filePath ?? TEXT.noFile}
         </span>
       </div>
 
-      <div className="flex flex-1 flex-col gap-2 px-4 py-3">
-        <div className="flex items-start justify-between gap-3">
+      <div className="flex flex-1 flex-col gap-2.5 px-4 py-3">
+        <div className="relative min-h-[22px] pr-[74px]">
           <h3
-            className="text-base font-semibold text-slate-900 dark:text-slate-50"
+            className={cn(
+              "truncate text-lg font-semibold text-slate-900 dark:text-slate-50",
+              isRoot && "text-xl text-blue-900 dark:text-blue-50",
+            )}
             title={node.name}
           >
             {node.name}
           </h3>
           <span
             className={cn(
-              "rounded-full border px-2 py-0.5 text-[10px] font-medium whitespace-nowrap",
+              "absolute top-0 right-0 rounded-full border px-2 py-0.5 text-[10px] font-medium whitespace-nowrap",
               badge.className,
             )}
           >
@@ -167,10 +284,10 @@ function FunctionNodeCard({
         </div>
 
         <p
-          className="text-xs leading-5 text-slate-600 dark:text-slate-300"
+          className="text-sm leading-6 text-slate-700 dark:text-slate-200"
           style={{
             display: "-webkit-box",
-            WebkitLineClamp: 3,
+            WebkitLineClamp: 2,
             WebkitBoxOrient: "vertical",
             overflow: "hidden",
           }}
@@ -197,6 +314,7 @@ export function FunctionOverviewPanel({
   emptyMessage?: string;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const sceneRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -204,6 +322,12 @@ export function FunctionOverviewPanel({
     originX: number;
     originY: number;
   } | null>(null);
+  const transformRef = useRef<ViewTransform>({
+    x: 0,
+    y: 0,
+    scale: 1,
+  });
+  const commitTimerRef = useRef<number | null>(null);
 
   const [transform, setTransform] = useState<ViewTransform>({
     x: 0,
@@ -216,10 +340,40 @@ export function FunctionOverviewPanel({
   const sceneWidth = layout?.width ?? 0;
   const sceneHeight = layout?.height ?? 0;
   const overviewSignature = overview?.root
-    ? `${overview.root.name}-${overview.root.filePath ?? "unknown"}-${
-        overview.root.children.length
-      }-${sceneWidth}-${sceneHeight}`
+    ? `${createOverviewSignature(overview.root)}-${overview.analyzedDepth}`
     : "empty";
+
+  const applySceneTransform = (nextTransform: ViewTransform) => {
+    transformRef.current = nextTransform;
+
+    if (sceneRef.current) {
+      sceneRef.current.style.transform = `translate(${nextTransform.x}px, ${nextTransform.y}px) scale(${nextTransform.scale})`;
+    }
+  };
+
+  const commitSceneTransform = (nextTransform?: ViewTransform) => {
+    if (nextTransform) {
+      applySceneTransform(nextTransform);
+    }
+
+    if (commitTimerRef.current !== null) {
+      window.clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+
+    setTransform(transformRef.current);
+  };
+
+  const scheduleSceneTransformCommit = () => {
+    if (commitTimerRef.current !== null) {
+      window.clearTimeout(commitTimerRef.current);
+    }
+
+    commitTimerRef.current = window.setTimeout(() => {
+      commitTimerRef.current = null;
+      setTransform(transformRef.current);
+    }, 80);
+  };
 
   useEffect(() => {
     const container = containerRef.current;
@@ -231,23 +385,33 @@ export function FunctionOverviewPanel({
     let frameId = 0;
     const syncView = () => {
       const rect = container.getBoundingClientRect();
+      const nextTransform =
+        !hasOverview || sceneWidth === 0 || sceneHeight === 0
+          ? { x: 0, y: 0, scale: 1 }
+          : (() => {
+              const fitScale = clamp(
+                Math.min(
+                  (rect.width - 32) / sceneWidth,
+                  (rect.height - 32) / sceneHeight,
+                ),
+                MIN_SCALE,
+                1,
+              );
 
-      if (!hasOverview || sceneWidth === 0 || sceneHeight === 0) {
-        setTransform({ x: 0, y: 0, scale: 1 });
-        return;
+              return {
+                scale: fitScale,
+                x: (rect.width - sceneWidth * fitScale) / 2,
+                y: (rect.height - sceneHeight * fitScale) / 2,
+              };
+            })();
+
+      transformRef.current = nextTransform;
+
+      if (sceneRef.current) {
+        sceneRef.current.style.transform = `translate(${nextTransform.x}px, ${nextTransform.y}px) scale(${nextTransform.scale})`;
       }
 
-      const fitScale = clamp(
-        Math.min((rect.width - 32) / sceneWidth, (rect.height - 32) / sceneHeight),
-        MIN_SCALE,
-        1,
-      );
-
-      setTransform({
-        scale: fitScale,
-        x: (rect.width - sceneWidth * fitScale) / 2,
-        y: (rect.height - sceneHeight * fitScale) / 2,
-      });
+      setTransform(nextTransform);
     };
 
     frameId = window.requestAnimationFrame(syncView);
@@ -260,29 +424,32 @@ export function FunctionOverviewPanel({
 
     return () => {
       window.cancelAnimationFrame(frameId);
+      if (commitTimerRef.current !== null) {
+        window.clearTimeout(commitTimerRef.current);
+        commitTimerRef.current = null;
+      }
       observer.disconnect();
     };
   }, [hasOverview, overviewSignature, sceneHeight, sceneWidth]);
 
   const adjustScale = (nextScale: number) => {
     const container = containerRef.current;
+
     if (!container) {
       return;
     }
 
     const rect = container.getBoundingClientRect();
+    const current = transformRef.current;
+    const safeScale = clamp(nextScale, MIN_SCALE, MAX_SCALE);
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const scaleRatio = safeScale / current.scale;
 
-    setTransform((current) => {
-      const safeScale = clamp(nextScale, MIN_SCALE, MAX_SCALE);
-      const centerX = rect.width / 2;
-      const centerY = rect.height / 2;
-      const scaleRatio = safeScale / current.scale;
-
-      return {
-        scale: safeScale,
-        x: centerX - (centerX - current.x) * scaleRatio,
-        y: centerY - (centerY - current.y) * scaleRatio,
-      };
+    commitSceneTransform({
+      scale: safeScale,
+      x: centerX - (centerX - current.x) * scaleRatio,
+      y: centerY - (centerY - current.y) * scaleRatio,
     });
   };
 
@@ -295,8 +462,8 @@ export function FunctionOverviewPanel({
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      originX: transform.x,
-      originY: transform.y,
+      originX: transformRef.current.x,
+      originY: transformRef.current.y,
     };
 
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -309,17 +476,18 @@ export function FunctionOverviewPanel({
       return;
     }
 
-    setTransform((current) => ({
-      ...current,
+    applySceneTransform({
+      ...transformRef.current,
       x: dragState.originX + event.clientX - dragState.startX,
       y: dragState.originY + event.clientY - dragState.startY,
-    }));
+    });
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
     if (dragRef.current?.pointerId === event.pointerId) {
       dragRef.current = null;
       event.currentTarget.releasePointerCapture(event.pointerId);
+      commitSceneTransform();
     }
   };
 
@@ -333,26 +501,25 @@ export function FunctionOverviewPanel({
     const rect = event.currentTarget.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;
     const pointerY = event.clientY - rect.top;
+    const current = transformRef.current;
+    const nextScale = clamp(
+      current.scale * (event.deltaY < 0 ? 1.1 : 0.9),
+      MIN_SCALE,
+      MAX_SCALE,
+    );
+    const scaleRatio = nextScale / current.scale;
 
-    setTransform((current) => {
-      const nextScale = clamp(
-        current.scale * (event.deltaY < 0 ? 1.1 : 0.9),
-        MIN_SCALE,
-        MAX_SCALE,
-      );
-      const scaleRatio = nextScale / current.scale;
-
-      return {
-        scale: nextScale,
-        x: pointerX - (pointerX - current.x) * scaleRatio,
-        y: pointerY - (pointerY - current.y) * scaleRatio,
-      };
+    applySceneTransform({
+      scale: nextScale,
+      x: pointerX - (pointerX - current.x) * scaleRatio,
+      y: pointerY - (pointerY - current.y) * scaleRatio,
     });
+    scheduleSceneTransformCommit();
   };
 
   const resetView = () => {
     if (!layout || !containerRef.current) {
-      setTransform({ x: 0, y: 0, scale: 1 });
+      commitSceneTransform({ x: 0, y: 0, scale: 1 });
       return;
     }
 
@@ -363,7 +530,7 @@ export function FunctionOverviewPanel({
       1,
     );
 
-    setTransform({
+    commitSceneTransform({
       scale: fitScale,
       x: (rect.width - layout.width * fitScale) / 2,
       y: (rect.height - layout.height * fitScale) / 2,
@@ -389,7 +556,7 @@ export function FunctionOverviewPanel({
           <div className="flex items-center gap-1">
             <button
               type="button"
-              onClick={() => adjustScale(transform.scale - 0.1)}
+              onClick={() => adjustScale(transformRef.current.scale - 0.1)}
               className="rounded-md border border-gray-200 bg-white p-1.5 text-gray-600 transition-colors hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1b1f27] dark:text-gray-300 dark:hover:bg-[#222733]"
               aria-label={TEXT.zoomOut}
               title={TEXT.zoomOut}
@@ -398,7 +565,7 @@ export function FunctionOverviewPanel({
             </button>
             <button
               type="button"
-              onClick={() => adjustScale(transform.scale + 0.1)}
+              onClick={() => adjustScale(transformRef.current.scale + 0.1)}
               className="rounded-md border border-gray-200 bg-white p-1.5 text-gray-600 transition-colors hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1b1f27] dark:text-gray-300 dark:hover:bg-[#222733]"
               aria-label={TEXT.zoomIn}
               title={TEXT.zoomIn}
@@ -426,7 +593,7 @@ export function FunctionOverviewPanel({
       <div
         ref={containerRef}
         className={cn(
-          "relative flex-1 overflow-hidden",
+          "relative flex-1 touch-none overflow-hidden",
           layout && "cursor-grab active:cursor-grabbing",
         )}
         onPointerDown={handlePointerDown}
@@ -454,12 +621,14 @@ export function FunctionOverviewPanel({
           </div>
         ) : (
           <div
+            ref={sceneRef}
             className="absolute left-0 top-0"
             style={{
               width: `${layout.width}px`,
               height: `${layout.height}px`,
               transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
               transformOrigin: "0 0",
+              willChange: "transform",
             }}
           >
             <svg
@@ -467,31 +636,19 @@ export function FunctionOverviewPanel({
               height={layout.height}
               className="absolute inset-0"
             >
-              {layout.nodes.length > 1 && (
-                <line
-                  x1={layout.connectorX}
-                  y1={layout.nodes[0].y + CARD_HEIGHT / 2}
-                  x2={layout.connectorX}
-                  y2={layout.nodes[layout.nodes.length - 1].y + CARD_HEIGHT / 2}
-                  stroke="rgba(71,85,105,0.58)"
-                  strokeWidth="2"
-                  strokeDasharray="8 8"
-                  strokeLinecap="round"
-                />
-              )}
-
-              {layout.nodes.map((node) => {
-                const anchorY = node.y + CARD_HEIGHT / 2;
+              {layout.edges.map((edge) => {
+                const elbowX = edge.fromX + ELBOW_OFFSET;
 
                 return (
                   <path
-                    key={`connector-${node.id}`}
-                    d={`M ${layout.connectorX} ${anchorY} L ${node.x - 18} ${anchorY}`}
+                    key={edge.id}
+                    d={`M ${edge.fromX} ${edge.fromY} H ${elbowX} V ${edge.toY} H ${edge.toX}`}
                     fill="none"
-                    stroke="rgba(71,85,105,0.7)"
-                    strokeWidth="2"
-                    strokeDasharray="8 8"
+                    stroke="rgba(51,65,85,0.8)"
+                    strokeWidth="2.2"
+                    strokeDasharray="7 7"
                     strokeLinecap="round"
+                    strokeLinejoin="round"
                   />
                 );
               })}
@@ -508,6 +665,7 @@ export function FunctionOverviewPanel({
               >
                 <FunctionNodeCard
                   node={layoutNode.node}
+                  depth={layoutNode.depth}
                   isSelected={
                     Boolean(layoutNode.node.filePath) &&
                     layoutNode.node.filePath === selectedFilePath

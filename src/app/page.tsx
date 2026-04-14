@@ -1,10 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { Search, Code2 } from "lucide-react";
 import { SiGithub } from "react-icons/si";
 
+import {
+  getAnalysisHistoryServerSnapshot,
+  getAnalysisHistorySnapshot,
+  subscribeAnalysisHistory,
+  type AnalysisHistoryRecord,
+} from "@/lib/analysisHistory";
 import { parseGitHubUrl } from "@/utils/github";
 
 const TEXT = {
@@ -24,12 +30,43 @@ const TEXT = {
   feature3Title: "AI \u8f85\u52a9\u5206\u6790",
   feature3Desc:
     "\u81ea\u52a8\u8bc6\u522b\u4e3b\u8981\u8bed\u8a00\u3001\u6280\u672f\u6808\u6807\u7b7e\u548c\u53ef\u80fd\u7684\u9879\u76ee\u5165\u53e3\u6587\u4ef6\u3002",
+  historyTitle: "\u5386\u53f2\u5206\u6790\u8bb0\u5f55",
+  historyEmpty:
+    "\u8fd8\u6ca1\u6709\u5386\u53f2\u8bb0\u5f55\u3002\u5b8c\u6210\u4e00\u6b21\u5206\u6790\u540e\uff0c\u8fd9\u91cc\u4f1a\u5c55\u793a\u5df2\u4fdd\u5b58\u7684\u5de5\u7a0b\u6587\u4ef6\u3002",
+  historyLanguagePrefix: "\u8bed\u8a00\uff1a",
+  historyUnknownLanguage: "\u672a\u8bc6\u522b",
+  historyUpdatedPrefix: "\u66f4\u65b0\u65f6\u95f4\uff1a",
 } as const;
 
 export default function Home() {
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+  const historyRecords = useSyncExternalStore<AnalysisHistoryRecord[]>(
+    subscribeAnalysisHistory,
+    getAnalysisHistorySnapshot,
+    getAnalysisHistoryServerSnapshot,
+  );
   const router = useRouter();
+
+  const formatHistoryTime = (timestamp: string) => {
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) {
+      return timestamp;
+    }
+
+    return date.toLocaleString("zh-CN", {
+      hour12: false,
+    });
+  };
+
+  const handleOpenHistory = (record: AnalysisHistoryRecord) => {
+    const params = new URLSearchParams({
+      repo: `${record.owner}/${record.repo}`,
+      history: record.id,
+    });
+
+    router.push(`/analyze?${params.toString()}`);
+  };
 
   const handleAnalyze = (e: React.FormEvent) => {
     e.preventDefault();
@@ -102,6 +139,66 @@ export default function Home() {
               {TEXT.analyze}
             </button>
           </form>
+
+          <div className="mt-6 border-t border-gray-200 pt-6 text-left dark:border-gray-800">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+                {TEXT.historyTitle}
+              </h2>
+              <span className="text-xs text-gray-500 dark:text-gray-400">
+                {historyRecords.length}
+              </span>
+            </div>
+
+            {historyRecords.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 p-4 text-xs leading-relaxed text-gray-500 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-400">
+                {TEXT.historyEmpty}
+              </div>
+            ) : (
+              <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
+                {historyRecords.map((record) => (
+                  <button
+                    key={record.id}
+                    type="button"
+                    onClick={() => handleOpenHistory(record)}
+                    className="w-full rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left transition-colors hover:border-blue-300 hover:bg-blue-50/70 dark:border-gray-700 dark:bg-gray-950 dark:hover:border-blue-700 dark:hover:bg-blue-950/30"
+                  >
+                    <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
+                      {record.projectName}
+                    </p>
+
+                    <p
+                      className="mt-1 truncate font-mono text-xs text-gray-600 dark:text-gray-300"
+                      title={record.repositoryUrl}
+                    >
+                      {record.repositoryUrl}
+                    </p>
+
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <span className="rounded-md border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700 dark:border-blue-800/60 dark:bg-blue-900/30 dark:text-blue-300">
+                        {TEXT.historyLanguagePrefix}
+                        {record.primaryLanguages[0] ?? TEXT.historyUnknownLanguage}
+                      </span>
+
+                      {record.techStack.slice(0, 2).map((item) => (
+                        <span
+                          key={`${record.id}-${item}`}
+                          className="rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[11px] text-gray-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300"
+                        >
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+
+                    <p className="mt-2 text-[11px] text-gray-500 dark:text-gray-400">
+                      {TEXT.historyUpdatedPrefix}
+                      {formatHistoryTime(record.updatedAt)}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 gap-6 border-t border-gray-200 pt-8 text-left md:grid-cols-3 dark:border-gray-800">

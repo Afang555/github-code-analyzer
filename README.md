@@ -49,6 +49,10 @@ OPENAI_COMPAT_MODEL=gpt-5.4
 # 可选：入口函数关键子函数识别模型
 # 不填写时会默认复用 OPENAI_COMPAT_MODEL
 # OPENAI_COMPAT_FUNCTION_MODEL=gpt-5.4
+# 可选：递归下钻深度（从入口函数的直接子函数开始计为 1）
+# 例如 2 表示会继续分析到“子函数的子函数”这一层
+# OPENAI_COMPAT_FUNCTION_MAX_DEPTH=2
+# GITHUB_TOKEN=github_pat_xxx
 ```
 
 3. 启动开发服务器
@@ -85,6 +89,7 @@ npm run start
 - AI 服务必须兼容 OpenAI `chat/completions` 接口。
 - 如果你的服务商不支持某些模型名，请在 `.env.local` 中显式配置可用模型。
 - 入口复核和关键子函数识别默认复用 `.env.local` 中的 `OPENAI_COMPAT_MODEL`，也可以分别单独覆盖。
+- 递归下钻深度默认是 `2`（从入口函数直接子函数开始计为第 1 层），可通过 `OPENAI_COMPAT_FUNCTION_MAX_DEPTH` 调整。
 
 ## English
 
@@ -99,7 +104,7 @@ GitHub Code Analyzer is a Next.js 16 application for inspecting public GitHub re
 - Browse source files with syntax highlighting
 - Detect primary languages, tech stack tags, and candidate entry files
 - Re-check candidate entry files using actual file content
-- Identify key child functions called by the verified entry function
+- Identify key child functions called by the verified entry function and recursively drill into important branches
 - Render a draggable and zoomable function overview panel beside the code viewer
 - Show AI analysis progress and entry-point review logs in the UI
 
@@ -124,6 +129,9 @@ OPENAI_COMPAT_API_KEY=your_api_key
 OPENAI_COMPAT_MODEL=gpt-5.4
 # OPENAI_COMPAT_ENTRY_MODEL=gpt-5.4
 # OPENAI_COMPAT_FUNCTION_MODEL=gpt-5.4
+# Drill-down depth starts at direct children of the entry function as level 1.
+# OPENAI_COMPAT_FUNCTION_MAX_DEPTH=2
+# GITHUB_TOKEN=github_pat_xxx
 ```
 
 3. Start the development server
@@ -147,5 +155,7 @@ npm run start
 
 - Public GitHub repositories only
 - The AI provider must support an OpenAI-compatible `chat/completions` endpoint
+- Configure `GITHUB_TOKEN` or `GITHUB_API_TOKEN` in `.env.local` if you want a higher GitHub API rate limit
 - Entry-point verification reuses `OPENAI_COMPAT_MODEL` by default unless `OPENAI_COMPAT_ENTRY_MODEL` is set
 - Function-level key child analysis also reuses `OPENAI_COMPAT_MODEL` by default unless `OPENAI_COMPAT_FUNCTION_MODEL` is set
+- Recursive drill-down depth defaults to `2` (entry child level is counted as level `1`) and can be overridden with `OPENAI_COMPAT_FUNCTION_MAX_DEPTH`

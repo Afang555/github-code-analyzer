@@ -304,6 +304,52 @@ export const functionCallOverviewJsonTemplate = `{
   }
 }`;
 
+export const functionCallDrillDownJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    name: {
+      type: "string",
+      description: "当前被下钻分析的函数名。",
+    },
+    filePath: {
+      type: ["string", "null"],
+      description: "当前函数定义所在文件路径；无法确认时返回 null。",
+    },
+    summary: {
+      type: "string",
+      description: "当前函数职责的简体中文摘要。",
+    },
+    shouldDive: {
+      type: "integer",
+      enum: [-1, 0, 1],
+      description:
+        "当前函数是否值得继续下钻：-1 表示不用继续，0 表示暂时不确定，1 表示值得继续。",
+    },
+    children: {
+      type: "array",
+      items: functionCallLeafNodeSchema,
+    },
+  },
+  required: ["name", "filePath", "summary", "shouldDive", "children"],
+} as const;
+
+export const functionCallDrillDownJsonTemplate = `{
+  "name": "loadConfig",
+  "filePath": "src/config/loadConfig.ts",
+  "summary": "负责读取配置并组装运行所需参数。",
+  "shouldDive": 1,
+  "children": [
+    {
+      "name": "resolveConfigPath",
+      "filePath": "src/config/path.ts",
+      "summary": "负责定位配置文件路径。",
+      "shouldDive": -1,
+      "children": []
+    }
+  ]
+}`;
+
 function normalizeStringArray(value: unknown, fieldName: string): string[] {
   if (!Array.isArray(value)) {
     throw new Error(`${TEXT.arrayPrefix}${fieldName}${TEXT.arraySuffix}`);
@@ -325,7 +371,7 @@ function normalizeOptionalString(value: unknown): string | null {
   return value.trim();
 }
 
-function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
+export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
   if (!value || typeof value !== "object") {
     throw new Error(TEXT.functionNodeObjectRequired);
   }
