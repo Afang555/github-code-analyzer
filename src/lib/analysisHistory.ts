@@ -2,9 +2,11 @@ import type { FileNode } from "@/types/github";
 import {
   normalizeAIAnalysisResult,
   normalizeFunctionCallOverview,
+  normalizeFunctionModules,
   type AIAnalysisResult,
   type FunctionCallNode,
   type FunctionCallOverview,
+  type FunctionModule,
 } from "@/types/aiAnalysis";
 
 const ANALYSIS_HISTORY_STORAGE_KEY = "github-code-analyzer:analysis-history:v1";
@@ -223,6 +225,7 @@ function normalizeRecord(value: unknown): AnalysisHistoryRecord | null {
           verifiedEntryPointReason:
             coerceString(value.verifiedEntryPointReason).trim() || null,
           functionCallOverview,
+          functionModules: normalizeFunctionModules(value.functionModules),
         }
       : null);
 
@@ -390,7 +393,7 @@ function renderFunctionCallNode(
 ) {
   const indent = "  ".repeat(depth);
   lines.push(
-    `${indent}- \`${node.name}\` | file: \`${node.filePath ?? "unknown"}\` | shouldDive: ${node.shouldDive}`,
+    `${indent}- \`${node.name}\` | module: \`${node.moduleId ?? "unassigned"}\` | file: \`${node.filePath ?? "unknown"}\` | shouldDive: ${node.shouldDive}`,
   );
   lines.push(`${indent}  summary: ${node.summary}`);
 
@@ -412,6 +415,17 @@ function renderFunctionCallOverview(overview: FunctionCallOverview | null): stri
 
   renderFunctionCallNode(overview.root, 0, lines);
   return lines;
+}
+
+function renderFunctionModules(modules: FunctionModule[]): string[] {
+  if (modules.length === 0) {
+    return ["No function modules are available."];
+  }
+
+  return modules.map(
+    (module) =>
+      `- [${module.id}] ${module.name}: ${module.summary}`,
+  );
 }
 
 function renderStringList(items: string[], emptyText: string): string[] {
@@ -468,6 +482,10 @@ export function buildAnalysisProjectMarkdown(
     "",
     `- Path: ${result?.verifiedEntryPoint ?? "N/A"}`,
     `- Reason: ${result?.verifiedEntryPointReason ?? "N/A"}`,
+    "",
+    "## Function Modules",
+    "",
+    ...renderFunctionModules(result?.functionModules ?? []),
     "",
     "## Complete Call Chain",
     "",

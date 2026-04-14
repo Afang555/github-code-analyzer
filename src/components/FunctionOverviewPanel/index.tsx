@@ -1,10 +1,27 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { GitBranch, Minus, Move, Plus, RotateCcw } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  GitBranch,
+  Maximize2,
+  Minimize2,
+  Minus,
+  Move,
+  Plus,
+  RotateCcw,
+} from "lucide-react";
 
+import {
+  buildFunctionModuleColorMap,
+  getFunctionModuleColor,
+  type FunctionModuleColor,
+} from "@/lib/functionModules";
 import { cn } from "@/lib/utils";
-import type { FunctionCallNode, FunctionCallOverview } from "@/types/aiAnalysis";
+import type {
+  FunctionCallNode,
+  FunctionCallOverview,
+  FunctionModule,
+} from "@/types/aiAnalysis";
 
 const CARD_WIDTH = 272;
 const CARD_HEIGHT = 136;
@@ -24,6 +41,8 @@ const TEXT = {
   zoomOut: "缩小",
   reset: "重置视图",
   dragHint: "拖拽平移，滚轮缩放",
+  fullscreen: "全屏",
+  exitFullscreen: "退出全屏",
   noFile: "文件待确认",
   needDive: "建议下钻",
   maybeDive: "待确认",
@@ -46,6 +65,8 @@ type LayoutNode = {
 
 type LayoutEdge = {
   id: string;
+  fromNodeId: string;
+  toNodeId: string;
   fromX: number;
   fromY: number;
   toX: number;
@@ -53,6 +74,7 @@ type LayoutEdge = {
 };
 
 type SubtreeLayout = {
+  rootId: string;
   nodes: LayoutNode[];
   edges: LayoutEdge[];
   height: number;
@@ -120,6 +142,7 @@ function layoutSubtree(
 
   if (node.children.length === 0) {
     return {
+      rootId: id,
       nodes: [
         {
           id,
@@ -166,7 +189,9 @@ function layoutSubtree(
     nodes.push(...shiftedChildLayout.nodes);
     edges.push(...shiftedChildLayout.edges);
     edges.push({
-      id: `${id}->${shiftedChildLayout.nodes[0]?.id ?? currentChildY}`,
+      id: `${id}->${shiftedChildLayout.rootId}`,
+      fromNodeId: id,
+      toNodeId: shiftedChildLayout.rootId,
       fromX: x + CARD_WIDTH,
       fromY: rootY,
       toX: shiftedChildLayout.rootX,
@@ -177,6 +202,7 @@ function layoutSubtree(
   }
 
   return {
+    rootId: id,
     nodes,
     edges,
     height,
@@ -220,11 +246,17 @@ function FunctionNodeCard({
   node,
   depth,
   isSelected,
+  isDimmed,
+  isModuleMatch,
+  moduleColor,
   onSelectFile,
 }: {
   node: FunctionCallNode;
   depth: number;
   isSelected: boolean;
+  isDimmed: boolean;
+  isModuleMatch: boolean;
+  moduleColor: FunctionModuleColor;
   onSelectFile?: (path: string) => void;
 }) {
   const badge = getDiveBadge(node);
@@ -242,20 +274,24 @@ function FunctionNodeCard({
       }}
       disabled={!canOpenFile}
       className={cn(
-        "flex h-[136px] w-[272px] flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left shadow-[0_10px_24px_rgba(15,23,42,0.12)] transition-transform dark:border-slate-100 dark:bg-[#191c22]",
+        "flex h-[136px] w-[272px] flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left shadow-[0_10px_24px_rgba(15,23,42,0.12)] transition-[transform,opacity,filter,box-shadow] dark:border-slate-100 dark:bg-[#191c22]",
         canOpenFile && "cursor-pointer hover:-translate-y-0.5",
         !canOpenFile && "cursor-default",
         isRoot &&
           "border-blue-700 shadow-[0_14px_26px_rgba(29,78,216,0.18)] dark:border-blue-300",
+        isModuleMatch && "ring-4 ring-amber-200/70 dark:ring-amber-500/40",
         isSelected &&
           "ring-4 ring-blue-200/70 dark:border-blue-300 dark:ring-blue-500/30",
+        isDimmed && "opacity-30 saturate-0",
       )}
     >
       <div
-        className={cn(
-          "border-b-2 border-slate-900 px-4 py-2 text-[11px] font-medium tracking-wide text-slate-500 dark:border-slate-100 dark:text-slate-400",
-          isRoot && "border-blue-700 bg-blue-50/60 text-blue-700 dark:border-blue-300 dark:bg-blue-950/30 dark:text-blue-300",
-        )}
+        className="border-b-2 px-4 py-2 text-[11px] font-medium tracking-wide"
+        style={{
+          borderColor: moduleColor.border,
+          backgroundColor: moduleColor.soft,
+          color: moduleColor.text,
+        }}
       >
         <span className="block truncate" title={node.filePath ?? TEXT.noFile}>
           {node.filePath ?? TEXT.noFile}
@@ -302,17 +338,22 @@ function FunctionNodeCard({
 
 export function FunctionOverviewPanel({
   overview,
+  modules = [],
+  activeModuleId = null,
   selectedFilePath,
   onSelectFile,
   isLoading = false,
   emptyMessage,
 }: {
   overview: FunctionCallOverview | null;
+  modules?: FunctionModule[];
+  activeModuleId?: string | null;
   selectedFilePath?: string;
   onSelectFile?: (path: string) => void;
   isLoading?: boolean;
   emptyMessage?: string;
 }) {
+  const rootRef = useRef<HTMLElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{
@@ -334,8 +375,17 @@ export function FunctionOverviewPanel({
     y: 0,
     scale: 1,
   });
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const layout = overview?.root ? createLayout(overview.root) : null;
+  const moduleColorMap = useMemo(
+    () => buildFunctionModuleColorMap(modules),
+    [modules],
+  );
+  const layoutNodeMap = useMemo(
+    () => new Map(layout?.nodes.map((item) => [item.id, item] as const) ?? []),
+    [layout],
+  );
   const hasOverview = Boolean(overview?.root);
   const sceneWidth = layout?.width ?? 0;
   const sceneHeight = layout?.height ?? 0;
@@ -431,6 +481,17 @@ export function FunctionOverviewPanel({
       observer.disconnect();
     };
   }, [hasOverview, overviewSignature, sceneHeight, sceneWidth]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(document.fullscreenElement === rootRef.current);
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, []);
 
   const adjustScale = (nextScale: number) => {
     const container = containerRef.current;
@@ -537,8 +598,27 @@ export function FunctionOverviewPanel({
     });
   };
 
+  const toggleFullscreen = async () => {
+    if (!rootRef.current) {
+      return;
+    }
+
+    try {
+      if (document.fullscreenElement === rootRef.current) {
+        await document.exitFullscreen();
+      } else {
+        await rootRef.current.requestFullscreen();
+      }
+    } catch {
+      // Ignore browser-specific fullscreen errors.
+    }
+  };
+
   return (
-    <aside className="flex min-w-0 flex-1 flex-col bg-[#f8f5ef] dark:bg-[#12151c]">
+    <aside
+      ref={rootRef}
+      className="flex min-w-0 flex-1 flex-col bg-[#f8f5ef] dark:bg-[#12151c]"
+    >
       <div className="border-b border-gray-200 bg-white/80 px-4 py-3 backdrop-blur dark:border-gray-800 dark:bg-[#171b22]/90">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -580,6 +660,21 @@ export function FunctionOverviewPanel({
               title={TEXT.reset}
             >
               <RotateCcw className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                void toggleFullscreen();
+              }}
+              className="rounded-md border border-gray-200 bg-white p-1.5 text-gray-600 transition-colors hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1b1f27] dark:text-gray-300 dark:hover:bg-[#222733]"
+              aria-label={isFullscreen ? TEXT.exitFullscreen : TEXT.fullscreen}
+              title={isFullscreen ? TEXT.exitFullscreen : TEXT.fullscreen}
+            >
+              {isFullscreen ? (
+                <Minimize2 className="h-3.5 w-3.5" />
+              ) : (
+                <Maximize2 className="h-3.5 w-3.5" />
+              )}
             </button>
           </div>
         </div>
@@ -638,15 +733,27 @@ export function FunctionOverviewPanel({
             >
               {layout.edges.map((edge) => {
                 const elbowX = edge.fromX + ELBOW_OFFSET;
+                const fromNode = layoutNodeMap.get(edge.fromNodeId);
+                const toNode = layoutNodeMap.get(edge.toNodeId);
+                const fromModuleId = fromNode?.node.moduleId ?? null;
+                const toModuleId = toNode?.node.moduleId ?? null;
+                const isEdgeHighlighted =
+                  !activeModuleId ||
+                  (fromModuleId === activeModuleId &&
+                    toModuleId === activeModuleId);
 
                 return (
                   <path
                     key={edge.id}
                     d={`M ${edge.fromX} ${edge.fromY} H ${elbowX} V ${edge.toY} H ${edge.toX}`}
                     fill="none"
-                    stroke="rgba(51,65,85,0.8)"
-                    strokeWidth="2.2"
-                    strokeDasharray="7 7"
+                    stroke={
+                      isEdgeHighlighted
+                        ? "rgba(51,65,85,0.8)"
+                        : "rgba(148,163,184,0.28)"
+                    }
+                    strokeWidth={isEdgeHighlighted ? 2.2 : 1.8}
+                    strokeDasharray={isEdgeHighlighted ? "7 7" : "5 8"}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                   />
@@ -654,26 +761,42 @@ export function FunctionOverviewPanel({
               })}
             </svg>
 
-            {layout.nodes.map((layoutNode) => (
-              <div
-                key={layoutNode.id}
-                className="absolute"
-                style={{
-                  left: `${layoutNode.x}px`,
-                  top: `${layoutNode.y}px`,
-                }}
-              >
-                <FunctionNodeCard
-                  node={layoutNode.node}
-                  depth={layoutNode.depth}
-                  isSelected={
-                    Boolean(layoutNode.node.filePath) &&
-                    layoutNode.node.filePath === selectedFilePath
-                  }
-                  onSelectFile={onSelectFile}
-                />
-              </div>
-            ))}
+            {layout.nodes.map((layoutNode) => {
+              const moduleColor = getFunctionModuleColor(
+                layoutNode.node.moduleId,
+                moduleColorMap,
+              );
+              const isDimmed =
+                Boolean(activeModuleId) &&
+                layoutNode.node.moduleId !== activeModuleId;
+              const isModuleMatch =
+                Boolean(activeModuleId) &&
+                layoutNode.node.moduleId === activeModuleId;
+
+              return (
+                <div
+                  key={layoutNode.id}
+                  className="absolute"
+                  style={{
+                    left: `${layoutNode.x}px`,
+                    top: `${layoutNode.y}px`,
+                  }}
+                >
+                  <FunctionNodeCard
+                    node={layoutNode.node}
+                    depth={layoutNode.depth}
+                    isSelected={
+                      Boolean(layoutNode.node.filePath) &&
+                      layoutNode.node.filePath === selectedFilePath
+                    }
+                    isDimmed={isDimmed}
+                    isModuleMatch={isModuleMatch}
+                    moduleColor={moduleColor}
+                    onSelectFile={onSelectFile}
+                  />
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

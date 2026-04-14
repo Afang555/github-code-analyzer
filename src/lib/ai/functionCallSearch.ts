@@ -113,6 +113,11 @@ type FunctionPattern = {
   mode: ExtractionMode;
 };
 
+type ParsedFunctionSearchName = {
+  normalizedName: string;
+  qualifiers: string[];
+};
+
 type LocatedPatternMatch = {
   mode: ExtractionMode;
   index: number;
@@ -399,7 +404,7 @@ function extractSingleSnippet(lines: string[], startLineIndex: number): string {
   return lines.slice(actualStartLineIndex, endLineIndex + 1).join("\n");
 }
 
-export function normalizeFunctionSearchName(name: string): string | null {
+function parseFunctionSearchName(name: string): ParsedFunctionSearchName | null {
   const trimmedName = name.trim().replace(/\(\)$/g, "");
   const lowered = trimmedName.toLowerCase();
 
@@ -407,18 +412,30 @@ export function normalizeFunctionSearchName(name: string): string | null {
     return null;
   }
 
-  const parts = trimmedName
+  const normalizedParts = trimmedName
     .split(/::|->|\.|#|\/|\\/g)
     .map((part) => part.trim())
     .filter(Boolean);
-  const candidate = parts[parts.length - 1] ?? trimmedName;
-  const normalized = candidate.replace(/^[`'"]+|[`'"]+$/g, "");
+  const normalizedCandidate = normalizedParts[normalizedParts.length - 1] ?? trimmedName;
+  const normalizedName = normalizedCandidate.replace(/^[`'"]+|[`'"]+$/g, "");
 
-  if (!normalized || !/^[A-Za-z_$][\w$]*$/.test(normalized)) {
+  if (!normalizedName || !/^[A-Za-z_$][\w$]*$/.test(normalizedName)) {
     return null;
   }
 
-  return normalized;
+  const qualifierParts = trimmedName
+    .split(/::|->|\.|#/g)
+    .map((part) => part.trim().replace(/^[`'"]+|[`'"]+$/g, ""))
+    .filter(Boolean);
+
+  return {
+    normalizedName,
+    qualifiers: qualifierParts.slice(0, -1),
+  };
+}
+
+export function normalizeFunctionSearchName(name: string): string | null {
+  return parseFunctionSearchName(name)?.normalizedName ?? null;
 }
 
 export function isLikelyNonProjectFunctionName(name: string): boolean {
@@ -436,10 +453,52 @@ export function isLikelyNonProjectFunctionName(name: string): boolean {
   );
 }
 
-function buildDefinitionPatterns(functionName: string): FunctionPattern[] {
+function buildDefinitionPatterns(
+  functionName: string,
+  qualifiers: string[] = [],
+): FunctionPattern[] {
   const name = escapeRegExp(functionName);
+  const patterns: FunctionPattern[] = [];
 
-  return [
+  if (qualifiers.length > 0) {
+    const qualifierTokens = qualifiers
+      .map((qualifier) => qualifier.trim())
+      .filter(Boolean)
+      .map((qualifier) => escapeRegExp(qualifier));
+    const qualifiedCppName = [...qualifierTokens, name].join("\\s*::\\s*");
+    const qualifiedDotName = [...qualifierTokens, name].join("\\s*[.#]\\s*");
+
+    patterns.push({
+      regex: new RegExp(
+        `^[\\t ]*(?:template\\s*<[^\\n{}]+>\\s*)?(?:(?:inline|static|virtual|constexpr|consteval|constinit|friend|extern|typename|auto|signed|unsigned|long|short|mutable|explicit)\\s+|(?:[A-Za-z_$~][\\w$:<>,\\[\\]\\*&?.~]*\\s+))*${qualifiedCppName}\\s*\\(`,
+        "m",
+      ),
+      mode: "brace",
+    });
+    patterns.push({
+      regex: new RegExp(
+        `^[\\t ]*(?:(?:public|private|protected|internal|static|readonly|abstract|override|virtual|final|open|sealed|partial|async)\\s+)*(?:[A-Za-z_$][\\w$:<>,\\[\\]\\*&?.]*\\s+)+${qualifiedDotName}\\s*\\(`,
+        "m",
+      ),
+      mode: "brace",
+    });
+    patterns.push({
+      regex: new RegExp(
+        `^[\\t ]*${qualifiedDotName}\\s*=\\s*(?:async\\s*)?function\\b`,
+        "m",
+      ),
+      mode: "brace",
+    });
+    patterns.push({
+      regex: new RegExp(
+        `^[\\t ]*${qualifiedDotName}\\s*=\\s*(?:async\\s*)?(?:\\([^\\n]*\\)|[A-Za-z_$][\\w$]*)\\s*=>`,
+        "m",
+      ),
+      mode: "single",
+    });
+  }
+
+  patterns.push(
     {
       regex: new RegExp(
         `^[\\t ]*(?:export\\s+default\\s+)?(?:export\\s+)?(?:async\\s+)?function\\*?\\s+${name}\\s*\\(`,
@@ -559,11 +618,17 @@ function buildDefinitionPatterns(functionName: string): FunctionPattern[] {
       ),
       mode: "brace",
     },
-  ];
+  );
+
+  return patterns;
 }
 
-function locatePatternMatch(content: string, functionName: string): LocatedPatternMatch | null {
-  const patterns = buildDefinitionPatterns(functionName);
+function locatePatternMatch(
+  content: string,
+  functionName: string,
+  qualifiers: string[] = [],
+): LocatedPatternMatch | null {
+  const patterns = buildDefinitionPatterns(functionName, qualifiers);
   let bestMatch: LocatedPatternMatch | null = null;
 
   for (const pattern of patterns) {
@@ -591,13 +656,18 @@ export function findFunctionDefinitionInContent(args: {
   functionName: string;
   strategy: FunctionSearchStrategy;
 }): FunctionDefinitionMatch | null {
-  const normalizedName = normalizeFunctionSearchName(args.functionName);
+  const parsedSearchName = parseFunctionSearchName(args.functionName);
+  const normalizedName = parsedSearchName?.normalizedName ?? null;
 
   if (!normalizedName) {
     return null;
   }
 
-  const patternMatch = locatePatternMatch(args.content, normalizedName);
+  const patternMatch = locatePatternMatch(
+    args.content,
+    normalizedName,
+    parsedSearchName?.qualifiers ?? [],
+  );
 
   if (!patternMatch) {
     return null;
@@ -629,7 +699,11 @@ function scoreSearchPath(args: {
   parentFilePath: string | null;
   hintedFilePath: string | null;
 }): number {
-  const normalizedName = normalizeFunctionSearchName(args.functionName)?.toLowerCase();
+  const parsedSearchName = parseFunctionSearchName(args.functionName);
+  const normalizedName = parsedSearchName?.normalizedName.toLowerCase() ?? null;
+  const qualifierHints = (parsedSearchName?.qualifiers ?? [])
+    .map((qualifier) => qualifier.toLowerCase().replace(/[^a-z0-9_]/g, ""))
+    .filter(Boolean);
   const lowerPath = args.path.toLowerCase();
   const lowerHintedPath = args.hintedFilePath?.toLowerCase() ?? null;
   const lowerParentPath = args.parentFilePath?.toLowerCase() ?? null;
@@ -662,6 +736,16 @@ function scoreSearchPath(args: {
     }
 
     if (lowerPath.includes(`/${normalizedName}/`)) {
+      score += 10;
+    }
+  }
+
+  for (const qualifierHint of qualifierHints) {
+    if (fileName.includes(qualifierHint)) {
+      score += 16;
+    }
+
+    if (lowerPath.includes(`/${qualifierHint}/`)) {
       score += 10;
     }
   }

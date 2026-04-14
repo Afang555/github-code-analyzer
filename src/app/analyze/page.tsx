@@ -1,6 +1,13 @@
 "use client";
 
-import { Suspense, useEffect, useEffectEvent, useRef, useState } from "react";
+import {
+  Suspense,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
@@ -23,6 +30,10 @@ import {
   getAnalysisHistoryRecordById,
   upsertAnalysisHistoryRecord,
 } from "@/lib/analysisHistory";
+import {
+  buildFunctionModuleColorMap,
+  getFunctionModuleColor,
+} from "@/lib/functionModules";
 import { stringifyJsonPreview } from "@/lib/jsonPreview";
 import { collectAnalysisCandidatePaths } from "@/lib/repositoryAnalysis";
 import { cn } from "@/lib/utils";
@@ -41,6 +52,8 @@ import {
   type FunctionCallNode,
   type FunctionCallAnalysisDebugData,
   type FunctionCallOverview,
+  type FunctionModule,
+  type FunctionModuleAnalysisDebugData,
 } from "@/types/aiAnalysis";
 import { parseGitHubUrl } from "@/utils/github";
 import { ANALYZE_TEXT as TEXT } from "./uiText";
@@ -48,6 +61,7 @@ import { ANALYZE_TEXT as TEXT } from "./uiText";
 type WorkLogLevel = "info" | "success" | "warning" | "error";
 type WorkspacePanelKey = "files" | "source" | "overview";
 type ResizeTarget = "sidebar" | "files" | "overview";
+type WorkflowStatus = "idle" | "running" | "finished";
 
 type WorkLogJsonSection = {
   label: string;
@@ -101,6 +115,30 @@ const LOG_LEVEL_STYLES: Record<
     border: "border-red-200 dark:border-red-900/40",
     dot: "bg-red-500",
     text: "text-red-600 dark:text-red-400",
+  },
+};
+
+const WORKFLOW_STATUS_STYLES: Record<
+  WorkflowStatus,
+  {
+    dot: string;
+    badge: string;
+  }
+> = {
+  idle: {
+    dot: "bg-slate-400",
+    badge:
+      "border-slate-200 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300",
+  },
+  running: {
+    dot: "bg-blue-500",
+    badge:
+      "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800/70 dark:bg-blue-900/30 dark:text-blue-300",
+  },
+  finished: {
+    dot: "bg-emerald-500",
+    badge:
+      "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800/70 dark:bg-emerald-900/30 dark:text-emerald-300",
   },
 };
 
@@ -239,6 +277,34 @@ function collectFunctionDescendants(root: FunctionCallNode, limit = 6): Function
   return nodes;
 }
 
+function collectFunctionModuleNodeCounts(
+  overview: FunctionCallOverview | null,
+): Map<string, number> {
+  const counts = new Map<string, number>();
+
+  if (!overview?.root) {
+    return counts;
+  }
+
+  const queue: FunctionCallNode[] = [overview.root];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+
+    if (!current) {
+      continue;
+    }
+
+    if (current.moduleId) {
+      counts.set(current.moduleId, (counts.get(current.moduleId) ?? 0) + 1);
+    }
+
+    queue.push(...current.children);
+  }
+
+  return counts;
+}
+
 function getEntryReviewLogLevel(
   attempt: EntryPointReviewAttempt,
 ): WorkLogLevel {
@@ -367,19 +433,37 @@ function WorkLogList({ logs }: { logs: WorkLogEntry[] }) {
 
 function WorkLogPanel({
   logs,
+  workflowStatus,
   onOpenFullscreen,
 }: {
   logs: WorkLogEntry[];
+  workflowStatus: WorkflowStatus;
   onOpenFullscreen: () => void;
 }) {
+  const workflowStyles = WORKFLOW_STATUS_STYLES[workflowStatus];
+  const workflowStatusLabel =
+    workflowStatus === "running"
+      ? TEXT.workflowRunning
+      : workflowStatus === "finished"
+        ? TEXT.workflowFinished
+        : TEXT.workflowIdle;
+
   return (
     <section className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-950">
       <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2 dark:border-gray-800">
         <div className="flex items-center gap-2">
-          <span className="h-2 w-2 rounded-full bg-blue-500"></span>
+          <span className={`h-2 w-2 rounded-full ${workflowStyles.dot}`}></span>
           <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200">
             {TEXT.workLog}
           </h2>
+          <span
+            className={cn(
+              "rounded-full border px-2 py-0.5 text-[10px] font-medium",
+              workflowStyles.badge,
+            )}
+          >
+            {workflowStatusLabel}
+          </span>
         </div>
 
         <div className="flex items-center gap-2">
@@ -527,6 +611,7 @@ function AnalyzePageContent() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysisResult | null>(null);
+  const [activeModuleId, setActiveModuleId] = useState<string | null>(null);
   const [isAnalyzingAI, setIsAnalyzingAI] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [workLogs, setWorkLogs] = useState<WorkLogEntry[]>([]);
@@ -664,6 +749,49 @@ function AnalyzePageContent() {
       return;
     }
 
+    const drillDownAttempts = debug.drillDownAttempts ?? [];
+    const cacheEvents = debug.cacheEvents ?? [];
+
+    for (const cacheEvent of cacheEvents) {
+      const title =
+        cacheEvent.event === "hit"
+          ? TEXT.functionCacheHit
+          : cacheEvent.event === "miss"
+            ? TEXT.functionCacheMiss
+            : cacheEvent.event === "store"
+              ? TEXT.functionCacheStore
+              : TEXT.functionCacheCycleGuard;
+      const level: WorkLogLevel =
+        cacheEvent.event === "hit"
+          ? "success"
+          : cacheEvent.event === "cycle_guard"
+            ? "warning"
+            : "info";
+
+      appendLog({
+        level,
+        title,
+        message: `函数：${cacheEvent.functionName}\n深度：${cacheEvent.depth}\n调用路径：${cacheEvent.callPath.join(" -> ")}\n缓存键：${cacheEvent.nodeKey}\n${cacheEvent.message}`,
+      });
+    }
+
+    for (const attempt of drillDownAttempts) {
+      appendLog({
+        level: attempt.status === "completed" ? "success" : "error",
+        title: TEXT.functionDrillDownTrace,
+        message: `函数：${attempt.functionName}\n父函数：${attempt.parentFunctionName}\n深度：${attempt.depth}\n调用路径：${attempt.callPath.join(" -> ")}\n定位文件：${attempt.locationFilePath ?? TEXT.unknownFunctionFile}\n状态：${
+          attempt.status === "completed" ? "完成" : "失败"
+        }\n${attempt.message}`,
+        requestPayload: buildModelRequestPayload(attempt.model ?? undefined),
+        responsePayload: buildModelResponsePayload(attempt.model ?? undefined, {
+          nodeKey: attempt.nodeKey,
+          status: attempt.status,
+          locationFilePath: attempt.locationFilePath,
+          message: attempt.message,
+        }),
+      });
+    }
+
     const requestPayload = buildModelRequestPayload(debug.model ?? undefined);
     const responsePayload = buildModelResponsePayload(
       debug.model ?? undefined,
@@ -701,6 +829,56 @@ function AnalyzePageContent() {
     });
   };
 
+  const appendFunctionModuleLogs = (
+    modules: FunctionModule[],
+    debug: FunctionModuleAnalysisDebugData | null,
+  ) => {
+    if (!debug) {
+      return;
+    }
+
+    const requestPayload = buildModelRequestPayload(debug.model ?? undefined);
+    const responsePayload = buildModelResponsePayload(
+      debug.model ?? undefined,
+      {
+        modules,
+        totalNodes: debug.totalNodes,
+        assignedNodes: debug.assignedNodes,
+        moduleCount: debug.moduleCount,
+      },
+    );
+
+    if (debug.status === "completed") {
+      appendLog({
+        level: "success",
+        title: TEXT.functionModuleCompleted,
+        message: debug.message,
+        requestPayload,
+        responsePayload,
+      });
+      return;
+    }
+
+    if (debug.status === "skipped") {
+      appendLog({
+        level: "info",
+        title: TEXT.functionModuleSkipped,
+        message: debug.message,
+        requestPayload,
+        responsePayload,
+      });
+      return;
+    }
+
+    appendLog({
+      level: debug.model ? "error" : "warning",
+      title: TEXT.functionModuleFailed,
+      message: debug.message,
+      requestPayload,
+      responsePayload,
+    });
+  };
+
   const restoreFromHistory = useEffectEvent((historyId: string): boolean => {
     const history = getAnalysisHistoryRecordById(historyId);
     if (!history) {
@@ -730,6 +908,7 @@ function AnalyzePageContent() {
     setFileTree(restoredFileTree);
     setSelectedFilePath(preferredFilePath);
     setAiAnalysis(history.analysisResult);
+    setActiveModuleId(null);
     setWorkLogs(history.workLogs);
 
     autoAnalyzedRepoRef.current = `${history.owner}/${history.repo}`;
@@ -760,6 +939,7 @@ function AnalyzePageContent() {
     setSelectedFilePath("");
     setRepoInfo(null);
     setAiAnalysis(null);
+    setActiveModuleId(null);
 
     appendLog({
       level: "info",
@@ -907,6 +1087,10 @@ function AnalyzePageContent() {
               data.result.functionCallOverview,
               data.debug.functionOverview,
             );
+            appendFunctionModuleLogs(
+              data.result.functionModules,
+              data.debug.moduleAnalysis,
+            );
           } else {
             setAiError(TEXT.invalidAiResponse);
             appendLog({
@@ -1016,6 +1200,18 @@ function AnalyzePageContent() {
     persistCurrentAnalysisHistory();
   }, [repoInfo, fileTree, aiAnalysis, workLogs, isLoading, isAnalyzingAI]);
 
+  useEffect(() => {
+    if (!activeModuleId) {
+      return;
+    }
+
+    if (aiAnalysis?.functionModules.some((module) => module.id === activeModuleId)) {
+      return;
+    }
+
+    setActiveModuleId(null);
+  }, [activeModuleId, aiAnalysis]);
+
   const handleAnalyzeClick = () => {
     const normalizedUrl = urlInput.trim();
 
@@ -1120,6 +1316,21 @@ function AnalyzePageContent() {
     }));
   };
 
+  const workflowStatus: WorkflowStatus =
+    isLoading || isAnalyzingAI
+      ? "running"
+      : workLogs.length > 0
+        ? "finished"
+        : "idle";
+  const moduleColorMap = useMemo(
+    () => buildFunctionModuleColorMap(aiAnalysis?.functionModules ?? []),
+    [aiAnalysis?.functionModules],
+  );
+  const moduleNodeCounts = useMemo(
+    () => collectFunctionModuleNodeCounts(aiAnalysis?.functionCallOverview ?? null),
+    [aiAnalysis?.functionCallOverview],
+  );
+
   const isFilesVisible = panelVisibility.files;
   const isSourceVisible = panelVisibility.source;
   const isOverviewVisible = panelVisibility.overview;
@@ -1157,6 +1368,7 @@ function AnalyzePageContent() {
             <div className="flex flex-col gap-4">
               <WorkLogPanel
                 logs={workLogs}
+                workflowStatus={workflowStatus}
                 onOpenFullscreen={() => setIsLogFullscreenOpen(true)}
               />
 
@@ -1260,6 +1472,64 @@ function AnalyzePageContent() {
                               </span>
                             ))}
                           </div>
+                        </div>
+                      )}
+
+                      {aiAnalysis.functionModules.length > 0 && (
+                        <div>
+                          <h4 className="mb-1.5 text-xs text-gray-500 dark:text-gray-500">
+                            {TEXT.functionModules}
+                          </h4>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setActiveModuleId(null)}
+                              className={cn(
+                                "rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
+                                activeModuleId === null
+                                  ? "border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-700 dark:bg-blue-900/30 dark:text-blue-300"
+                                  : "border-gray-200 bg-white text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300 dark:hover:bg-gray-800",
+                              )}
+                            >
+                              {TEXT.allModules}
+                            </button>
+                            {aiAnalysis.functionModules.map((module) => {
+                              const color = getFunctionModuleColor(
+                                module.id,
+                                moduleColorMap,
+                              );
+                              const isActive = activeModuleId === module.id;
+                              const nodeCount = moduleNodeCounts.get(module.id) ?? 0;
+
+                              return (
+                                <button
+                                  key={module.id}
+                                  type="button"
+                                  onClick={() =>
+                                    setActiveModuleId((current) =>
+                                      current === module.id ? null : module.id,
+                                    )
+                                  }
+                                  className={cn(
+                                    "rounded-full border px-2.5 py-1 text-[11px] font-medium transition-shadow",
+                                    isActive && "ring-2 ring-offset-1 ring-slate-300",
+                                  )}
+                                  style={{
+                                    borderColor: color.border,
+                                    backgroundColor: color.soft,
+                                    color: color.text,
+                                  }}
+                                  title={module.summary}
+                                >
+                                  {module.name}
+                                  <span className="ml-1 opacity-80">({nodeCount})</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <p className="mt-2 text-[11px] leading-relaxed text-gray-500 dark:text-gray-400">
+                            {TEXT.moduleFilterHint}
+                          </p>
                         </div>
                       )}
 
@@ -1511,6 +1781,8 @@ function AnalyzePageContent() {
                 >
                   <FunctionOverviewPanel
                     overview={aiAnalysis?.functionCallOverview ?? null}
+                    modules={aiAnalysis?.functionModules ?? []}
+                    activeModuleId={activeModuleId}
                     selectedFilePath={selectedFilePath}
                     onSelectFile={setSelectedFilePath}
                     isLoading={isAnalyzingAI}

@@ -8,10 +8,17 @@ export interface RepositoryAnalysisContext {
 
 export type FunctionShouldDive = -1 | 0 | 1;
 
+export interface FunctionModule {
+  id: string;
+  name: string;
+  summary: string;
+}
+
 export interface FunctionCallNode {
   name: string;
   filePath: string | null;
   summary: string;
+  moduleId: string | null;
   shouldDive: FunctionShouldDive;
   children: FunctionCallNode[];
 }
@@ -29,6 +36,7 @@ export interface AIAnalysisResult {
   verifiedEntryPoint: string | null;
   verifiedEntryPointReason: string | null;
   functionCallOverview: FunctionCallOverview | null;
+  functionModules: FunctionModule[];
 }
 
 export interface AIModelDebugAttempt {
@@ -77,11 +85,51 @@ export interface EntryPointVerificationDebugData {
   verifiedEntryPointReason: string | null;
 }
 
+export type FunctionDrillDownDebugAttemptStatus = "completed" | "error";
+
+export interface FunctionDrillDownDebugAttempt {
+  nodeKey: string;
+  functionName: string;
+  parentFunctionName: string;
+  depth: number;
+  callPath: string[];
+  locationFilePath: string | null;
+  status: FunctionDrillDownDebugAttemptStatus;
+  message: string;
+  model: AIModelDebugData | null;
+}
+
+export type FunctionDrillDownCacheEventType =
+  | "hit"
+  | "miss"
+  | "store"
+  | "cycle_guard";
+
+export interface FunctionDrillDownCacheEvent {
+  nodeKey: string;
+  functionName: string;
+  depth: number;
+  callPath: string[];
+  event: FunctionDrillDownCacheEventType;
+  message: string;
+}
+
 export interface FunctionCallAnalysisDebugData {
   targetEntryPoint: string | null;
   readmePath: string | null;
   status: "completed" | "skipped" | "error";
   message: string;
+  model: AIModelDebugData | null;
+  drillDownAttempts: FunctionDrillDownDebugAttempt[];
+  cacheEvents: FunctionDrillDownCacheEvent[];
+}
+
+export interface FunctionModuleAnalysisDebugData {
+  status: "completed" | "skipped" | "error";
+  message: string;
+  totalNodes: number;
+  assignedNodes: number;
+  moduleCount: number;
   model: AIModelDebugData | null;
 }
 
@@ -89,6 +137,7 @@ export interface RepositoryAnalysisDebugData {
   repositoryAnalysis: AIModelDebugData;
   entryVerification: EntryPointVerificationDebugData | null;
   functionOverview: FunctionCallAnalysisDebugData | null;
+  moduleAnalysis: FunctionModuleAnalysisDebugData | null;
 }
 
 export interface AnalyzeRepoSuccessResponse {
@@ -371,6 +420,45 @@ function normalizeOptionalString(value: unknown): string | null {
   return value.trim();
 }
 
+export function normalizeFunctionModules(value: unknown): FunctionModule[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const modules: FunctionModule[] = [];
+  const seenIds = new Set<string>();
+
+  for (const [index, item] of value.entries()) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+    const name = normalizeOptionalString(record.name);
+    const summary = normalizeOptionalString(record.summary);
+
+    if (!name || !summary) {
+      continue;
+    }
+
+    const normalizedId =
+      normalizeOptionalString(record.id) ?? `module-${index + 1}`;
+
+    if (seenIds.has(normalizedId)) {
+      continue;
+    }
+
+    seenIds.add(normalizedId);
+    modules.push({
+      id: normalizedId,
+      name,
+      summary,
+    });
+  }
+
+  return modules.slice(0, 10);
+}
+
 export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
   if (!value || typeof value !== "object") {
     throw new Error(TEXT.functionNodeObjectRequired);
@@ -400,6 +488,7 @@ export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
     name: name.trim(),
     filePath: normalizeOptionalString(node.filePath),
     summary: summary.trim(),
+    moduleId: normalizeOptionalString(node.moduleId),
     shouldDive: node.shouldDive,
     children: node.children.map((child) => normalizeFunctionCallNode(child)),
   };
@@ -465,6 +554,7 @@ export function normalizeAIAnalysisResult(value: unknown): AIAnalysisResult {
       result.functionCallOverview === null
         ? null
         : normalizeFunctionCallOverview(result.functionCallOverview),
+    functionModules: normalizeFunctionModules(result.functionModules),
   };
 }
 
@@ -562,6 +652,44 @@ function isEntryPointVerificationDebugData(
   );
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isFunctionDrillDownDebugAttempt(
+  value: unknown,
+): value is FunctionDrillDownDebugAttempt {
+  return (
+    isRecord(value) &&
+    typeof value.nodeKey === "string" &&
+    typeof value.functionName === "string" &&
+    typeof value.parentFunctionName === "string" &&
+    typeof value.depth === "number" &&
+    isStringArray(value.callPath) &&
+    (value.locationFilePath === null || typeof value.locationFilePath === "string") &&
+    (value.status === "completed" || value.status === "error") &&
+    typeof value.message === "string" &&
+    (value.model === null || isAIModelDebugData(value.model))
+  );
+}
+
+function isFunctionDrillDownCacheEvent(
+  value: unknown,
+): value is FunctionDrillDownCacheEvent {
+  return (
+    isRecord(value) &&
+    typeof value.nodeKey === "string" &&
+    typeof value.functionName === "string" &&
+    typeof value.depth === "number" &&
+    isStringArray(value.callPath) &&
+    (value.event === "hit" ||
+      value.event === "miss" ||
+      value.event === "store" ||
+      value.event === "cycle_guard") &&
+    typeof value.message === "string"
+  );
+}
+
 function isFunctionCallAnalysisDebugData(
   value: unknown,
 ): value is FunctionCallAnalysisDebugData {
@@ -574,6 +702,28 @@ function isFunctionCallAnalysisDebugData(
       value.status === "skipped" ||
       value.status === "error") &&
     typeof value.message === "string" &&
+    (value.model === null || isAIModelDebugData(value.model)) &&
+    (Array.isArray(value.drillDownAttempts)
+      ? value.drillDownAttempts.every(isFunctionDrillDownDebugAttempt)
+      : value.drillDownAttempts === undefined) &&
+    (Array.isArray(value.cacheEvents)
+      ? value.cacheEvents.every(isFunctionDrillDownCacheEvent)
+      : value.cacheEvents === undefined)
+  );
+}
+
+function isFunctionModuleAnalysisDebugData(
+  value: unknown,
+): value is FunctionModuleAnalysisDebugData {
+  return (
+    isRecord(value) &&
+    (value.status === "completed" ||
+      value.status === "skipped" ||
+      value.status === "error") &&
+    typeof value.message === "string" &&
+    typeof value.totalNodes === "number" &&
+    typeof value.assignedNodes === "number" &&
+    typeof value.moduleCount === "number" &&
     (value.model === null || isAIModelDebugData(value.model))
   );
 }
@@ -587,7 +737,9 @@ export function isRepositoryAnalysisDebugData(
     (value.entryVerification === null ||
       isEntryPointVerificationDebugData(value.entryVerification)) &&
     (value.functionOverview === null ||
-      isFunctionCallAnalysisDebugData(value.functionOverview))
+      isFunctionCallAnalysisDebugData(value.functionOverview)) &&
+    (value.moduleAnalysis === null ||
+      isFunctionModuleAnalysisDebugData(value.moduleAnalysis))
   );
 }
 

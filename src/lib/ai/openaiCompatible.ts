@@ -14,6 +14,7 @@ import {
   normalizeEntryPointReviewResult,
   normalizeFunctionCallNode,
   normalizeFunctionCallOverview,
+  normalizeFunctionModules,
   type AIAnalysisResult,
   type AIModelDebugAttempt,
   type AIModelDebugData,
@@ -22,7 +23,11 @@ import {
   type EntryPointVerificationDebugData,
   type FunctionCallNode,
   type FunctionCallAnalysisDebugData,
+  type FunctionDrillDownCacheEvent,
+  type FunctionDrillDownDebugAttempt,
   type FunctionCallOverview,
+  type FunctionModule,
+  type FunctionModuleAnalysisDebugData,
   type RepositoryAnalysisContext,
   type RepositoryAnalysisDebugData,
 } from "@/types/aiAnalysis";
@@ -44,6 +49,9 @@ const DEFAULT_ENTRY_POINT_REVIEW_MODEL =
 const DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL =
   process.env.OPENAI_COMPAT_FUNCTION_MODEL?.trim() ||
   DEFAULT_REPOSITORY_ANALYSIS_MODEL;
+const DEFAULT_FUNCTION_MODULE_ANALYSIS_MODEL =
+  process.env.OPENAI_COMPAT_MODULE_MODEL?.trim() ||
+  DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL;
 const MAX_ANALYSIS_PATHS = 1000;
 const MAX_LOCATION_GUESS_PROMPT_PATHS = 260;
 const MAX_DRILL_DOWN_PROMPT_PATHS = 260;
@@ -57,6 +65,7 @@ const PROJECT_INTRO_DIRECT_READ_LINE_LIMIT = 300;
 const PROJECT_INTRO_SEGMENT_LINE_COUNT = 150;
 const MAX_KEY_SUB_FUNCTIONS = 20;
 const MAX_FUNCTION_LOCATION_GUESS_PATHS = 6;
+const MAX_FUNCTION_MODULES = 10;
 const DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH = parsePositiveIntegerEnv(
   process.env.OPENAI_COMPAT_FUNCTION_MAX_DEPTH,
   2,
@@ -106,6 +115,7 @@ const TEXT = {
     "只返回合法 JSON。",
     "不要使用 Markdown 代码块包裹 JSON。",
     "只分析入口函数或模块启动主链路中直接调用、且对项目核心功能有明显影响的关键子函数。",
+    "不要返回仅执行常规数据结构操作（如遍历、映射、过滤、排序、增删改查）或字符串操作（如拼接、截取、替换、格式化）的调用，除非该调用承载核心业务决策。",
     "关键子函数数量不能超过 20 个。",
     "忽略简单常量、样式拼装、薄包装函数、纯展示叶子组件、日志封装、类型定义和明显不重要的辅助函数。",
     "根据函数名、仓库文件列表、项目简介和入口文件内容，保守判断 filePath、summary 和 shouldDive。",
@@ -118,6 +128,7 @@ const TEXT = {
     "如果入口逻辑主要表现为匿名默认导出或模块级启动逻辑，可以使用保守的入口标识名，例如 default export 或 module bootstrap。",
     "每个子函数都要给出最可能的定义文件路径；无法判断时返回 null。",
     "summary 字段必须是简洁的简体中文功能说明。",
+    "在面向对象语言中，children 里的子函数 name 需要尽量带所属类名或类型名；C++ 请使用 ClassName::FunctionName 形式。",
     "shouldDive 字段必须使用 -1、0、1，分别表示不需要继续下钻、不确定、需要继续下钻。",
     "关键子函数数量最多 20 个。",
     "请严格按照下面的模板返回 JSON：",
@@ -161,6 +172,15 @@ const TEXT = {
   functionOverviewRootMissing: "函数调用全景结果缺少 root 节点。",
   functionOverviewSuccessPrefix: "已识别入口函数及 ",
   functionOverviewSuccessSuffix: " 个关键子函数。",
+  functionModuleSkippedNoOverview:
+    "No function overview is available, skipped function module analysis.",
+  functionModuleFallbackName: "Uncategorized Module",
+  functionModuleFallbackSummary:
+    "Fallback module used when AI module classification is unavailable.",
+  functionModuleSuccessPrefix:
+    "Function modules classified successfully. Modules: ",
+  functionModuleSuccessMiddle: ", assigned nodes: ",
+  functionModuleSuccessSuffix: ".",
 } as const;
 
 const functionLocationGuessJsonSchema = {
@@ -212,6 +232,7 @@ const FUNCTION_DRILL_DOWN_SYSTEM_MESSAGES = [
   "只返回合法 JSON，不要输出 Markdown 代码块。",
   "只识别当前函数直接调用、且对核心业务链路有明显影响的关键子函数。",
   "忽略系统函数、标准库函数、第三方库函数、简单包装函数、日志函数、样式拼装和明显非核心的辅助函数。",
+  "排除仅执行常规数据结构操作（如遍历、映射、过滤、排序、增删改查）或字符串操作（如拼接、截取、替换、格式化）的调用，除非它们承载核心业务决策。",
   "children 字段只保留第一层关键子函数，每个子函数的 children 必须返回空数组。",
   "shouldDive 只能返回 -1、0、1。",
   "如果当前函数本身已经属于非核心逻辑，可以将 shouldDive 设为 -1，并返回空 children。",
@@ -223,10 +244,78 @@ const FUNCTION_DRILL_DOWN_USER_MESSAGES = [
   "请基于当前函数的源码片段，识别它直接调用的关键子函数。",
   "name 和 filePath 字段表示当前正在分析的函数本身，请保守填写。",
   "children 中的每个子函数都要给出最可能的定义文件路径；无法判断时返回 null。",
+  "在面向对象语言中，children 里的子函数 name 需要尽量带所属类名或类型名；C++ 请使用 ClassName::FunctionName 形式。",
   "summary 字段必须是简体中文的简洁功能说明。",
   "如果子函数明显属于系统函数、第三方库函数或非关键逻辑，请不要放入 children。",
   "如果某个仓库内自定义函数是否值得继续下钻无法确定，shouldDive 优先返回 0，而不是直接返回 -1。",
   "请严格按照下面的模板返回 JSON：",
+] as const;
+
+const functionModuleAnalysisJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    modules: {
+      type: "array",
+      maxItems: MAX_FUNCTION_MODULES,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          name: { type: "string" },
+          summary: { type: "string" },
+        },
+        required: ["id", "name", "summary"],
+      },
+    },
+    nodeAssignments: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          nodeId: { type: "string" },
+          moduleId: { type: "string" },
+        },
+        required: ["nodeId", "moduleId"],
+      },
+    },
+  },
+  required: ["modules", "nodeAssignments"],
+} as const;
+
+const functionModuleAnalysisJsonTemplate = `{
+  "modules": [
+    {
+      "id": "module-core",
+      "name": "Core Flow",
+      "summary": "核心流程模块，负责主路径中的关键业务协调。"
+    }
+  ],
+  "nodeAssignments": [
+    {
+      "nodeId": "root",
+      "moduleId": "module-core"
+    }
+  ]
+}`;
+
+const FUNCTION_MODULE_ANALYSIS_SYSTEM_MESSAGES = [
+  "你是一名资深软件架构师。",
+  "你需要根据项目上下文和函数节点信息，对函数调用全景进行功能模块划分。",
+  "所有自然语言输出必须使用简体中文。",
+  "模块数量不得超过 10 个。",
+  "每个函数节点都必须被分配到且仅分配到一个模块。",
+  "只返回合法 JSON，不要使用 Markdown 代码块。",
+] as const;
+
+const FUNCTION_MODULE_ANALYSIS_USER_MESSAGES = [
+  "请对函数节点进行功能模块划分，并返回模块定义与节点归属关系。",
+  "模块应语义清晰，避免按文件夹机械分组。",
+  "优先根据函数职责、调用链关系、业务边界进行聚类。",
+  "nodeAssignments 应覆盖所有 nodeId。",
+  "请严格按照下面模板返回 JSON：",
 ] as const;
 
 type OpenAIMessage = {
@@ -291,6 +380,31 @@ type FunctionOverviewOutcome = {
   debug: FunctionCallAnalysisDebugData;
 };
 
+type FunctionNodeDescriptor = {
+  nodeId: string;
+  parentNodeId: string | null;
+  depth: number;
+  name: string;
+  filePath: string | null;
+  summary: string;
+};
+
+type FunctionModuleNodeAssignment = {
+  nodeId: string;
+  moduleId: string;
+};
+
+type FunctionModuleAnalysisResult = {
+  modules: FunctionModule[];
+  nodeAssignments: FunctionModuleNodeAssignment[];
+};
+
+type FunctionModuleOutcome = {
+  overview: FunctionCallOverview | null;
+  modules: FunctionModule[];
+  debug: FunctionModuleAnalysisDebugData;
+};
+
 type FunctionLocationGuessResult = {
   candidatePaths: string[];
   reason: string;
@@ -312,7 +426,10 @@ type FunctionDrillDownContext = {
   projectIntroduction: ProjectIntroductionExcerpt;
   loadFileContent: (path: string) => Promise<string>;
   maxDepth: number;
-  visitedNodeKeys: Set<string>;
+  inProgressNodeKeys: Set<string>;
+  resultCache: Map<string, FunctionDrillDownResult>;
+  drillDownAttempts: FunctionDrillDownDebugAttempt[];
+  cacheEvents: FunctionDrillDownCacheEvent[];
 };
 
 type FunctionDrillDownResult = {
@@ -328,6 +445,22 @@ const CLEAR_STOP_DIVE_NAME_PATTERNS = [
 const CLEAR_STOP_DIVE_SUMMARY_PATTERNS = [
   /日志|埋点|样式|格式化|转换|映射|比较|校验|断言|常量|枚举|拼接|展示|渲染|包装|封装/,
 ] as const;
+
+const OOP_PRIMARY_LANGUAGE_MARKERS = [
+  "c++",
+  "cpp",
+  "cxx",
+  "cc",
+  "c#",
+  "java",
+  "kotlin",
+  "swift",
+  "php",
+  "ruby",
+  "scala",
+] as const;
+
+const CPP_PRIMARY_LANGUAGE_MARKERS = ["c++", "cpp", "cxx", "cc"] as const;
 
 function parsePositiveIntegerEnv(
   value: string | undefined,
@@ -359,6 +492,29 @@ function isClearlyStopDiveNode(node: FunctionCallNode): boolean {
   );
 }
 
+function buildOOPNamingRequirementLines(primaryLanguages: string[]): string[] {
+  const lowered = primaryLanguages.map((language) => language.toLowerCase());
+  const hasOOPLanguage = OOP_PRIMARY_LANGUAGE_MARKERS.some((marker) =>
+    lowered.some((language) => language.includes(marker)),
+  );
+
+  if (!hasOOPLanguage) {
+    return [];
+  }
+
+  const hasCpp = CPP_PRIMARY_LANGUAGE_MARKERS.some((marker) =>
+    lowered.some((language) => language.includes(marker)),
+  );
+
+  return hasCpp
+    ? [
+        "命名要求：对于面向对象语言，子函数 name 请尽量包含所属类名或类型名；当前项目包含 C++ 时，成员函数必须优先使用 ClassName::FunctionName。",
+      ]
+    : [
+        "命名要求：对于面向对象语言，子函数 name 请尽量包含所属类名或类型名（例如 ClassName.methodName）。",
+      ];
+}
+
 function buildDrillDownVisitKey(
   node: Pick<FunctionCallNode, "name" | "filePath">,
 ): string {
@@ -368,6 +524,48 @@ function buildDrillDownVisitKey(
   const normalizedPath = node.filePath?.trim().toLowerCase() || "__unknown__";
 
   return `${normalizedPath}::${normalizedName}`;
+}
+
+function buildDepthAwareDrillDownVisitKey(
+  node: Pick<FunctionCallNode, "name" | "filePath">,
+  depth: number,
+): string {
+  return `${buildDrillDownVisitKey(node)}::depth-${depth}`;
+}
+
+function cloneFunctionCallNode(node: FunctionCallNode): FunctionCallNode {
+  return {
+    ...node,
+    children: node.children.map((child) => cloneFunctionCallNode(child)),
+  };
+}
+
+function cloneFunctionDrillDownResult(
+  result: FunctionDrillDownResult,
+): FunctionDrillDownResult {
+  return {
+    analyzedDepth: result.analyzedDepth,
+    node: cloneFunctionCallNode(result.node),
+  };
+}
+
+function pushDrillDownCacheEvent(args: {
+  context: FunctionDrillDownContext;
+  nodeKey: string;
+  functionName: string;
+  depth: number;
+  callPath: string[];
+  event: FunctionDrillDownCacheEvent["event"];
+  message: string;
+}) {
+  args.context.cacheEvents.push({
+    nodeKey: args.nodeKey,
+    functionName: args.functionName,
+    depth: args.depth,
+    callPath: [...args.callPath],
+    event: args.event,
+    message: args.message,
+  });
 }
 
 function markNodeAsStopped(
@@ -560,6 +758,7 @@ function buildFunctionOverviewMessages(args: {
       role: "user",
       content: [
         ...TEXT.functionOverviewUserMessages,
+        ...buildOOPNamingRequirementLines(analysisResult.primaryLanguages),
         functionCallOverviewJsonTemplate,
         TEXT.schemaIntro,
         JSON.stringify(functionCallOverviewJsonSchema),
@@ -605,6 +804,217 @@ function buildProjectIntroductionLines(
         projectIntroduction.excerpt.content,
       ]
     : [TEXT.projectIntroductionUnavailable];
+}
+
+function createFallbackFunctionModule(): FunctionModule {
+  return {
+    id: "module-uncategorized",
+    name: TEXT.functionModuleFallbackName,
+    summary: TEXT.functionModuleFallbackSummary,
+  };
+}
+
+function ensureFunctionModules(modules: FunctionModule[]): FunctionModule[] {
+  if (modules.length > 0) {
+    return modules.slice(0, MAX_FUNCTION_MODULES);
+  }
+
+  return [createFallbackFunctionModule()];
+}
+
+function collectFunctionNodeDescriptors(root: FunctionCallNode): FunctionNodeDescriptor[] {
+  const descriptors: FunctionNodeDescriptor[] = [];
+
+  const visit = (
+    node: FunctionCallNode,
+    nodeId: string,
+    parentNodeId: string | null,
+    depth: number,
+  ) => {
+    descriptors.push({
+      nodeId,
+      parentNodeId,
+      depth,
+      name: node.name,
+      filePath: node.filePath,
+      summary: node.summary,
+    });
+
+    for (const [index, child] of node.children.entries()) {
+      visit(child, `${nodeId}.${index}`, nodeId, depth + 1);
+    }
+  };
+
+  visit(root, "root", null, 0);
+  return descriptors;
+}
+
+function normalizeFunctionModuleNodeAssignments(
+  value: unknown,
+): FunctionModuleNodeAssignment[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const assignments: FunctionModuleNodeAssignment[] = [];
+
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+    const nodeId =
+      typeof record.nodeId === "string" ? record.nodeId.trim() : "";
+    const moduleId =
+      typeof record.moduleId === "string" ? record.moduleId.trim() : "";
+
+    if (!nodeId || !moduleId) {
+      continue;
+    }
+
+    assignments.push({ nodeId, moduleId });
+  }
+
+  return assignments;
+}
+
+function normalizeFunctionModuleAnalysisResult(
+  value: unknown,
+): FunctionModuleAnalysisResult {
+  if (!value || typeof value !== "object") {
+    throw new Error("Function module analysis result must be a JSON object.");
+  }
+
+  const result = value as Record<string, unknown>;
+
+  return {
+    modules: normalizeFunctionModules(result.modules),
+    nodeAssignments: normalizeFunctionModuleNodeAssignments(
+      result.nodeAssignments,
+    ),
+  };
+}
+
+function buildFunctionModuleAnalysisMessages(args: {
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  nodes: FunctionNodeDescriptor[];
+}): OpenAIMessage[] {
+  const { repositoryContext, analysisResult, nodes } = args;
+
+  const moduleInputLines = nodes.map(
+    (node) =>
+      `- nodeId: ${node.nodeId} | parentNodeId: ${
+        node.parentNodeId ?? "null"
+      } | depth: ${node.depth} | name: ${node.name} | filePath: ${
+        node.filePath ?? "null"
+      } | summary: ${node.summary}`,
+  );
+
+  return [
+    {
+      role: "system",
+      content: FUNCTION_MODULE_ANALYSIS_SYSTEM_MESSAGES.join(" "),
+    },
+    {
+      role: "user",
+      content: [
+        ...FUNCTION_MODULE_ANALYSIS_USER_MESSAGES,
+        functionModuleAnalysisJsonTemplate,
+        TEXT.schemaIntro,
+        JSON.stringify(functionModuleAnalysisJsonSchema),
+        `${TEXT.repositoryUrl}${repositoryContext.repositoryUrl}`,
+        `${TEXT.repositoryDescription}${
+          repositoryContext.repositoryDescription?.trim() || TEXT.noDescription
+        }`,
+        `${TEXT.repositorySummary}${analysisResult.summary || TEXT.noSummary}`,
+        `${TEXT.primaryLanguages}${
+          analysisResult.primaryLanguages.join("、") || TEXT.noLanguages
+        }`,
+        `${TEXT.techStack}${
+          analysisResult.techStack.join("、") || TEXT.noTechStack
+        }`,
+        `Function node count: ${nodes.length}`,
+        "Function nodes:",
+        ...moduleInputLines,
+      ].join("\n"),
+    },
+  ];
+}
+
+function applyFunctionModulesToOverview(args: {
+  overview: FunctionCallOverview;
+  moduleAnalysis: FunctionModuleAnalysisResult;
+}): {
+  overview: FunctionCallOverview;
+  modules: FunctionModule[];
+  totalNodes: number;
+  assignedNodes: number;
+} {
+  const { overview, moduleAnalysis } = args;
+  const root = overview.root;
+
+  if (!root) {
+    return {
+      overview,
+      modules: [],
+      totalNodes: 0,
+      assignedNodes: 0,
+    };
+  }
+
+  const nodes = collectFunctionNodeDescriptors(root);
+  const modules = ensureFunctionModules(moduleAnalysis.modules);
+  const moduleIdSet = new Set(modules.map((module) => module.id));
+  const nodeIdSet = new Set(nodes.map((node) => node.nodeId));
+  const assignmentMap = new Map<string, string>();
+  const defaultModuleId = modules[0]?.id ?? createFallbackFunctionModule().id;
+
+  for (const assignment of moduleAnalysis.nodeAssignments) {
+    if (
+      !nodeIdSet.has(assignment.nodeId) ||
+      !moduleIdSet.has(assignment.moduleId)
+    ) {
+      continue;
+    }
+
+    assignmentMap.set(assignment.nodeId, assignment.moduleId);
+  }
+
+  let assignedNodes = 0;
+
+  const applyToNode = (
+    node: FunctionCallNode,
+    nodeId: string,
+    inheritedModuleId: string | null,
+  ): FunctionCallNode => {
+    const candidateModuleId =
+      assignmentMap.get(nodeId) ?? inheritedModuleId ?? defaultModuleId;
+    const resolvedModuleId = moduleIdSet.has(candidateModuleId)
+      ? candidateModuleId
+      : defaultModuleId;
+
+    assignedNodes += 1;
+
+    return {
+      ...node,
+      moduleId: resolvedModuleId,
+      children: node.children.map((child, index) =>
+        applyToNode(child, `${nodeId}.${index}`, resolvedModuleId),
+      ),
+    };
+  };
+
+  return {
+    overview: {
+      ...overview,
+      root: applyToNode(root, "root", null),
+    },
+    modules,
+    totalNodes: nodes.length,
+    assignedNodes,
+  };
 }
 
 function normalizeFunctionLocationGuessResult(
@@ -716,6 +1126,7 @@ function buildFunctionDrillDownMessages(args: {
       role: "user",
       content: [
         ...FUNCTION_DRILL_DOWN_USER_MESSAGES,
+        ...buildOOPNamingRequirementLines(analysisResult.primaryLanguages),
         functionCallDrillDownJsonTemplate,
         TEXT.schemaIntro,
         JSON.stringify(functionCallDrillDownJsonSchema),
@@ -1326,110 +1737,281 @@ async function drillDownFunctionNode(args: {
     };
   }
 
-  const visitKey = buildDrillDownVisitKey(node);
-  if (context.visitedNodeKeys.has(visitKey)) {
+  const requestVisitKey = buildDepthAwareDrillDownVisitKey(node, depth);
+  const cachedByRequestKey = context.resultCache.get(requestVisitKey);
+
+  if (cachedByRequestKey) {
+    pushDrillDownCacheEvent({
+      context,
+      nodeKey: requestVisitKey,
+      functionName: node.name,
+      depth,
+      callPath,
+      event: "hit",
+      message: "命中函数下钻缓存，复用已分析结果。",
+    });
+    return cloneFunctionDrillDownResult(cachedByRequestKey);
+  }
+
+  if (context.inProgressNodeKeys.has(requestVisitKey)) {
+    pushDrillDownCacheEvent({
+      context,
+      nodeKey: requestVisitKey,
+      functionName: node.name,
+      depth,
+      callPath,
+      event: "cycle_guard",
+      message: "检测到同键节点仍在分析中，触发循环保护并停止本次下钻。",
+    });
     return {
       node: markNodeAsStopped(node),
       analyzedDepth: Math.min(depth - 1, context.maxDepth),
     };
   }
-  context.visitedNodeKeys.add(visitKey);
 
-  const located = await locateFunctionDefinition({
-    repositoryContext: context.repositoryContext,
-    analysisResult: context.analysisResult,
-    functionName: node.name,
-    parentFunctionName,
-    parentFilePath,
-    hintedFilePath: node.filePath,
-    promptFilePaths: context.promptFilePaths,
-    searchFilePaths: context.searchFilePaths,
-    loadFileContent: context.loadFileContent,
-  });
-
-  if (!located.location) {
-    return {
-      node: markNodeAsStopped(node),
-      analyzedDepth: depth,
-    };
-  }
-
-  const snippetExcerpt = prepareFileExcerpt(located.location.snippet, {
-    directLineLimit: FUNCTION_SNIPPET_DIRECT_READ_LINE_LIMIT,
-    segmentLineCount: FUNCTION_SNIPPET_SEGMENT_LINE_COUNT,
-  });
-  const drillDownPromptPaths = buildDrillDownPromptPaths({
-    node,
-    parentFilePath,
-    resolvedFilePath: located.location.filePath,
+  pushDrillDownCacheEvent({
     context,
+    nodeKey: requestVisitKey,
+    functionName: node.name,
+    depth,
+    callPath,
+    event: "miss",
+    message: "未命中函数下钻缓存，开始下钻分析。",
   });
+
+  context.inProgressNodeKeys.add(requestVisitKey);
+  let resolvedVisitKey: string | null = null;
+  let resolvedVisitKeyAdded = false;
+  let resolvedFilePath: string | null = null;
 
   try {
-    const drillDown = await requestJsonCompletion<FunctionCallNode>({
-      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
-      messages: buildFunctionDrillDownMessages({
-        repositoryContext: context.repositoryContext,
-        analysisResult: context.analysisResult,
-        targetFunction: node,
-        parentFunctionName,
-        callPath,
-        location: located.location,
-        snippetExcerpt,
-        projectIntroduction: context.projectIntroduction,
-        filePaths: drillDownPromptPaths,
-      }),
-      schemaName: "function_call_drill_down",
-      schema: functionCallDrillDownJsonSchema as Record<string, unknown>,
-      normalize: normalizeFunctionCallNode,
+    const located = await locateFunctionDefinition({
+      repositoryContext: context.repositoryContext,
+      analysisResult: context.analysisResult,
+      functionName: node.name,
+      parentFunctionName,
+      parentFilePath,
+      hintedFilePath: node.filePath,
+      promptFilePaths: context.promptFilePaths,
+      searchFilePaths: context.searchFilePaths,
+      loadFileContent: context.loadFileContent,
     });
 
-    const normalizedNode: FunctionCallNode = {
-      ...drillDown.result,
-      name: node.name,
-      filePath: located.location.filePath,
-      children: drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
-    };
-
-    if (normalizedNode.shouldDive === -1 || normalizedNode.children.length === 0) {
-      return {
-        node: markNodeAsStopped(normalizedNode, located.location.filePath),
+    if (!located.location) {
+      const stoppedResult: FunctionDrillDownResult = {
+        node: markNodeAsStopped(node),
         analyzedDepth: depth,
       };
-    }
-
-    const resolvedChildren: FunctionCallNode[] = [];
-    let analyzedDepth = depth;
-
-    for (const child of normalizedNode.children) {
-      const childResult = await drillDownFunctionNode({
-        node: child,
-        parentFunctionName: normalizedNode.name,
-        parentFilePath: located.location.filePath,
-        callPath: [...callPath, child.name],
-        depth: depth + 1,
+      const cachedResult = cloneFunctionDrillDownResult(stoppedResult);
+      context.resultCache.set(requestVisitKey, cachedResult);
+      pushDrillDownCacheEvent({
         context,
+        nodeKey: requestVisitKey,
+        functionName: node.name,
+        depth,
+        callPath,
+        event: "store",
+        message: "函数定位失败，缓存停止下钻结果。",
       });
-      resolvedChildren.push(childResult.node);
-      analyzedDepth = Math.max(analyzedDepth, childResult.analyzedDepth);
+      return cloneFunctionDrillDownResult(cachedResult);
     }
 
-    return {
-      node: {
-        ...normalizedNode,
-        children: resolvedChildren,
-      },
-      analyzedDepth,
-    };
-  } catch (error) {
-    if (error instanceof AIModelInvocationError) {
-      return {
-        node: markNodeAsStopped(node, located.location.filePath),
-        analyzedDepth: depth,
+    resolvedFilePath = located.location.filePath;
+    resolvedVisitKey = buildDepthAwareDrillDownVisitKey(
+      { name: node.name, filePath: resolvedFilePath },
+      depth,
+    );
+
+    if (resolvedVisitKey !== requestVisitKey) {
+      const cachedByResolvedKey = context.resultCache.get(resolvedVisitKey);
+      if (cachedByResolvedKey) {
+        const clonedCachedResult =
+          cloneFunctionDrillDownResult(cachedByResolvedKey);
+        context.resultCache.set(
+          requestVisitKey,
+          cloneFunctionDrillDownResult(clonedCachedResult),
+        );
+        pushDrillDownCacheEvent({
+          context,
+          nodeKey: resolvedVisitKey,
+          functionName: node.name,
+          depth,
+          callPath,
+          event: "hit",
+          message: "按定位后的函数键命中缓存，复用下钻结果。",
+        });
+        return clonedCachedResult;
+      }
+
+      if (context.inProgressNodeKeys.has(resolvedVisitKey)) {
+        pushDrillDownCacheEvent({
+          context,
+          nodeKey: resolvedVisitKey,
+          functionName: node.name,
+          depth,
+          callPath,
+          event: "cycle_guard",
+          message: "定位后函数键仍在分析中，触发循环保护并停止本次下钻。",
+        });
+        return {
+          node: markNodeAsStopped(node, resolvedFilePath),
+          analyzedDepth: Math.min(depth - 1, context.maxDepth),
+        };
+      }
+
+      context.inProgressNodeKeys.add(resolvedVisitKey);
+      resolvedVisitKeyAdded = true;
+    }
+
+    const snippetExcerpt = prepareFileExcerpt(located.location.snippet, {
+      directLineLimit: FUNCTION_SNIPPET_DIRECT_READ_LINE_LIMIT,
+      segmentLineCount: FUNCTION_SNIPPET_SEGMENT_LINE_COUNT,
+    });
+    const drillDownPromptPaths = buildDrillDownPromptPaths({
+      node,
+      parentFilePath,
+      resolvedFilePath: located.location.filePath,
+      context,
+    });
+
+    try {
+      const drillDown = await requestJsonCompletion<FunctionCallNode>({
+        model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+        messages: buildFunctionDrillDownMessages({
+          repositoryContext: context.repositoryContext,
+          analysisResult: context.analysisResult,
+          targetFunction: node,
+          parentFunctionName,
+          callPath,
+          location: located.location,
+          snippetExcerpt,
+          projectIntroduction: context.projectIntroduction,
+          filePaths: drillDownPromptPaths,
+        }),
+        schemaName: "function_call_drill_down",
+        schema: functionCallDrillDownJsonSchema as Record<string, unknown>,
+        normalize: normalizeFunctionCallNode,
+      });
+
+      context.drillDownAttempts.push({
+        nodeKey: resolvedVisitKey ?? requestVisitKey,
+        functionName: node.name,
+        parentFunctionName,
+        depth,
+        callPath: [...callPath],
+        locationFilePath: located.location.filePath,
+        status: "completed",
+        message: "关键子函数下钻分析完成。",
+        model: drillDown.debug,
+      });
+
+      const normalizedNode: FunctionCallNode = {
+        ...drillDown.result,
+        name: node.name,
+        filePath: located.location.filePath,
+        children: drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
       };
-    }
 
-    throw error;
+      let finalResult: FunctionDrillDownResult;
+
+      if (
+        normalizedNode.shouldDive === -1 ||
+        normalizedNode.children.length === 0
+      ) {
+        finalResult = {
+          node: markNodeAsStopped(normalizedNode, located.location.filePath),
+          analyzedDepth: depth,
+        };
+      } else {
+        const resolvedChildren: FunctionCallNode[] = [];
+        let analyzedDepth = depth;
+
+        for (const child of normalizedNode.children) {
+          const childResult = await drillDownFunctionNode({
+            node: child,
+            parentFunctionName: normalizedNode.name,
+            parentFilePath: located.location.filePath,
+            callPath: [...callPath, child.name],
+            depth: depth + 1,
+            context,
+          });
+          resolvedChildren.push(childResult.node);
+          analyzedDepth = Math.max(analyzedDepth, childResult.analyzedDepth);
+        }
+
+        finalResult = {
+          node: {
+            ...normalizedNode,
+            children: resolvedChildren,
+          },
+          analyzedDepth,
+        };
+      }
+
+      const cachedResult = cloneFunctionDrillDownResult(finalResult);
+      context.resultCache.set(requestVisitKey, cachedResult);
+      if (resolvedVisitKey && resolvedVisitKey !== requestVisitKey) {
+        context.resultCache.set(
+          resolvedVisitKey,
+          cloneFunctionDrillDownResult(cachedResult),
+        );
+      }
+      pushDrillDownCacheEvent({
+        context,
+        nodeKey: resolvedVisitKey ?? requestVisitKey,
+        functionName: node.name,
+        depth,
+        callPath,
+        event: "store",
+        message: "已缓存函数下钻结果。",
+      });
+
+      return cloneFunctionDrillDownResult(cachedResult);
+    } catch (error) {
+      if (error instanceof AIModelInvocationError) {
+        context.drillDownAttempts.push({
+          nodeKey: resolvedVisitKey ?? requestVisitKey,
+          functionName: node.name,
+          parentFunctionName,
+          depth,
+          callPath: [...callPath],
+          locationFilePath: located.location.filePath,
+          status: "error",
+          message: error.message,
+          model: error.debug,
+        });
+
+        const stoppedResult: FunctionDrillDownResult = {
+          node: markNodeAsStopped(node, located.location.filePath),
+          analyzedDepth: depth,
+        };
+        const cachedResult = cloneFunctionDrillDownResult(stoppedResult);
+        context.resultCache.set(requestVisitKey, cachedResult);
+        if (resolvedVisitKey && resolvedVisitKey !== requestVisitKey) {
+          context.resultCache.set(
+            resolvedVisitKey,
+            cloneFunctionDrillDownResult(cachedResult),
+          );
+        }
+        pushDrillDownCacheEvent({
+          context,
+          nodeKey: resolvedVisitKey ?? requestVisitKey,
+          functionName: node.name,
+          depth,
+          callPath,
+          event: "store",
+          message: "下钻分析失败，缓存停止下钻结果。",
+        });
+        return cloneFunctionDrillDownResult(cachedResult);
+      }
+
+      throw error;
+    }
+  } finally {
+    context.inProgressNodeKeys.delete(requestVisitKey);
+    if (resolvedVisitKeyAdded && resolvedVisitKey) {
+      context.inProgressNodeKeys.delete(resolvedVisitKey);
+    }
   }
 }
 
@@ -1612,6 +2194,8 @@ async function analyzeFunctionOverview(args: {
         status: "skipped",
         message: TEXT.functionOverviewSkippedNoEntry,
         model: null,
+        drillDownAttempts: [],
+        cacheEvents: [],
       },
     };
   }
@@ -1635,6 +2219,8 @@ async function analyzeFunctionOverview(args: {
           error instanceof Error ? error.message : String(error)
         }`,
         model: null,
+        drillDownAttempts: [],
+        cacheEvents: [],
       },
     };
   }
@@ -1664,6 +2250,8 @@ async function analyzeFunctionOverview(args: {
           status: "error",
           message: TEXT.functionOverviewRootMissing,
           model: overview.debug,
+          drillDownAttempts: [],
+          cacheEvents: [],
         },
       };
     }
@@ -1685,7 +2273,10 @@ async function analyzeFunctionOverview(args: {
       projectIntroduction,
       loadFileContent,
       maxDepth: DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH,
-      visitedNodeKeys: new Set<string>(),
+      inProgressNodeKeys: new Set<string>(),
+      resultCache: new Map<string, FunctionDrillDownResult>(),
+      drillDownAttempts: [],
+      cacheEvents: [],
     };
 
     for (const child of normalizedRootNode.children) {
@@ -1721,6 +2312,8 @@ async function analyzeFunctionOverview(args: {
             : 0
         } 个非根节点，最大下钻层级 ${normalizedResult.analyzedDepth}，配置上限 ${DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH}。`,
         model: overview.debug,
+        drillDownAttempts: drillDownContext.drillDownAttempts,
+        cacheEvents: drillDownContext.cacheEvents,
       },
     };
   } catch (error) {
@@ -1732,6 +2325,92 @@ async function analyzeFunctionOverview(args: {
           readmePath: projectIntroduction.path,
           status: "error",
           message: error.message,
+          model: error.debug,
+          drillDownAttempts: [],
+          cacheEvents: [],
+        },
+      };
+    }
+
+    throw error;
+  }
+}
+
+async function analyzeFunctionModules(args: {
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  overview: FunctionCallOverview | null;
+}): Promise<FunctionModuleOutcome> {
+  const { repositoryContext, analysisResult, overview } = args;
+
+  if (!overview?.root) {
+    return {
+      overview,
+      modules: [],
+      debug: {
+        status: "skipped",
+        message: TEXT.functionModuleSkippedNoOverview,
+        totalNodes: 0,
+        assignedNodes: 0,
+        moduleCount: 0,
+        model: null,
+      },
+    };
+  }
+
+  const nodes = collectFunctionNodeDescriptors(overview.root);
+
+  try {
+    const moduleAnalysis = await requestJsonCompletion<FunctionModuleAnalysisResult>(
+      {
+        model: DEFAULT_FUNCTION_MODULE_ANALYSIS_MODEL,
+        messages: buildFunctionModuleAnalysisMessages({
+          repositoryContext,
+          analysisResult,
+          nodes,
+        }),
+        schemaName: "function_module_analysis",
+        schema: functionModuleAnalysisJsonSchema as Record<string, unknown>,
+        normalize: normalizeFunctionModuleAnalysisResult,
+      },
+    );
+
+    const applied = applyFunctionModulesToOverview({
+      overview,
+      moduleAnalysis: moduleAnalysis.result,
+    });
+
+    return {
+      overview: applied.overview,
+      modules: applied.modules,
+      debug: {
+        status: "completed",
+        message: `${TEXT.functionModuleSuccessPrefix}${applied.modules.length}${TEXT.functionModuleSuccessMiddle}${applied.assignedNodes}/${applied.totalNodes}${TEXT.functionModuleSuccessSuffix}`,
+        totalNodes: applied.totalNodes,
+        assignedNodes: applied.assignedNodes,
+        moduleCount: applied.modules.length,
+        model: moduleAnalysis.debug,
+      },
+    };
+  } catch (error) {
+    if (error instanceof AIModelInvocationError) {
+      const applied = applyFunctionModulesToOverview({
+        overview,
+        moduleAnalysis: {
+          modules: [],
+          nodeAssignments: [],
+        },
+      });
+
+      return {
+        overview: applied.overview,
+        modules: applied.modules,
+        debug: {
+          status: "error",
+          message: error.message,
+          totalNodes: applied.totalNodes,
+          assignedNodes: applied.assignedNodes,
+          moduleCount: applied.modules.length,
           model: error.debug,
         },
       };
@@ -1774,6 +2453,7 @@ export async function analyzeRepository(args: {
         repositoryAnalysis: error.debug,
         entryVerification: null,
         functionOverview: null,
+        moduleAnalysis: null,
       });
     }
 
@@ -1791,6 +2471,7 @@ export async function analyzeRepository(args: {
     verifiedEntryPoint: entryVerification.verifiedEntryPoint,
     verifiedEntryPointReason: entryVerification.verifiedEntryPointReason,
     functionCallOverview: null,
+    functionModules: [],
   };
 
   const functionOverview = await analyzeFunctionOverview({
@@ -1799,15 +2480,26 @@ export async function analyzeRepository(args: {
     filePaths,
   });
 
+  const moduleAnalysis = await analyzeFunctionModules({
+    repositoryContext,
+    analysisResult: {
+      ...baseAnalysisResult,
+      functionCallOverview: functionOverview.result,
+    },
+    overview: functionOverview.result,
+  });
+
   return {
     result: {
       ...baseAnalysisResult,
-      functionCallOverview: functionOverview.result,
+      functionCallOverview: moduleAnalysis.overview,
+      functionModules: moduleAnalysis.modules,
     },
     debug: {
       repositoryAnalysis: repositoryAnalysis.debug,
       entryVerification: entryVerification.debug,
       functionOverview: functionOverview.debug,
+      moduleAnalysis: moduleAnalysis.debug,
     },
   };
 }
