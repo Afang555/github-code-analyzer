@@ -92,6 +92,12 @@ export const ANALYZE_TEXT = {
   functionOverviewFailed: "\u5173\u952e\u5b50\u51fd\u6570\u8bc6\u522b\u5931\u8d25",
   currentRepo: "\u5f53\u524d\u4ed3\u5e93",
   branchPrefix: "\u5206\u652f\uff1a",
+  panelDisplay: "\u9762\u677f\u663e\u793a",
+  panelFiles: "\u6587\u4ef6\u5217\u8868",
+  panelSource: "\u6e90\u7801",
+  panelOverview: "\u5168\u666f\u56fe",
+  allPanelsHidden:
+    "\u53f3\u4fa7\u9762\u677f\u5df2\u5168\u90e8\u9690\u85cf\uff0c\u53ef\u901a\u8fc7\u53f3\u4e0a\u89d2\u5f00\u5173\u91cd\u65b0\u663e\u793a\u3002",
   projectFiles: "\u9879\u76ee\u6587\u4ef6\u7ed3\u6784",
   loadingTree: "\u6b63\u5728\u83b7\u53d6\u4ed3\u5e93\u6587\u4ef6\u6811...",
   enterValidUrl:

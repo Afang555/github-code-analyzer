@@ -89,7 +89,7 @@ export function CodeViewer({ owner, repo, branch, path }: CodeViewerProps) {
   }
 
   return (
-    <div className="flex h-full w-full min-w-0 flex-col overflow-hidden border-l border-gray-200 bg-[#1e1e1e] dark:border-gray-800">
+    <div className="flex h-full w-full min-w-0 flex-col overflow-hidden bg-[#1e1e1e]">
       <div className="flex items-center justify-between border-b border-gray-200 bg-gray-100 px-4 py-2 dark:border-gray-700 dark:bg-gray-800">
         <span
           className="truncate font-mono text-sm text-gray-700 dark:text-gray-300"

@@ -18,6 +18,7 @@ import { FileTree } from "@/components/FileTree";
 import { FunctionOverviewPanel } from "@/components/FunctionOverviewPanel";
 import { stringifyJsonPreview } from "@/lib/jsonPreview";
 import { collectAnalysisCandidatePaths } from "@/lib/repositoryAnalysis";
+import { cn } from "@/lib/utils";
 import {
   getRepositoryInfo,
   getRepositoryTree,
@@ -37,6 +38,8 @@ import { parseGitHubUrl } from "@/utils/github";
 import { ANALYZE_TEXT as TEXT } from "./uiText";
 
 type WorkLogLevel = "info" | "success" | "warning" | "error";
+type WorkspacePanelKey = "files" | "source" | "overview";
+type ResizeTarget = "sidebar" | "files" | "overview";
 
 type WorkLogJsonSection = {
   label: string;
@@ -52,6 +55,15 @@ type WorkLogEntry = {
   requestPayload?: unknown;
   responsePayload?: unknown;
   jsonSections?: WorkLogJsonSection[];
+};
+
+type WorkspacePanelVisibility = Record<WorkspacePanelKey, boolean>;
+
+type ResizeState = {
+  target: ResizeTarget;
+  startX: number;
+  startWidth: number;
+  invertDelta?: boolean;
 };
 
 const LOG_LEVEL_STYLES: Record<
@@ -83,6 +95,22 @@ const LOG_LEVEL_STYLES: Record<
     text: "text-red-600 dark:text-red-400",
   },
 };
+
+const PANEL_LIMITS: Record<ResizeTarget, { min: number; max: number }> = {
+  sidebar: { min: 280, max: 520 },
+  files: { min: 240, max: 420 },
+  overview: { min: 300, max: 620 },
+};
+
+const DEFAULT_PANEL_VISIBILITY: WorkspacePanelVisibility = {
+  files: true,
+  source: true,
+  overview: true,
+};
+
+function clampPanelWidth(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
 
 function countFilesInTree(nodes: FileNode[]): number {
   let count = 0;
@@ -384,10 +412,65 @@ function WorkLogFullscreenDialog({
   );
 }
 
+function ResizeHandle({
+  isActive,
+  onPointerDown,
+  label,
+}: {
+  isActive: boolean;
+  onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      onPointerDown={onPointerDown}
+      className="group flex h-full w-3 flex-shrink-0 cursor-col-resize touch-none items-stretch justify-center bg-transparent outline-none"
+    >
+      <span
+        className={cn(
+          "my-3 w-px rounded-full bg-gray-200 transition-colors dark:bg-gray-800",
+          isActive
+            ? "bg-blue-500 dark:bg-blue-400"
+            : "group-hover:bg-blue-400/80 dark:group-hover:bg-blue-500/70",
+        )}
+      />
+    </button>
+  );
+}
+
+function PanelToggleButton({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        "rounded-full border px-3 py-1.5 text-xs font-medium transition-colors",
+        active
+          ? "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800/60 dark:bg-blue-900/30 dark:text-blue-300"
+          : "border-gray-200 bg-white text-gray-500 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-400 dark:hover:bg-gray-800",
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
 function AnalyzePageContent() {
   const searchParams = useSearchParams();
   const autoAnalyzedRepoRef = useRef<string | null>(null);
   const logCounterRef = useRef(0);
+  const resizeStateRef = useRef<ResizeState | null>(null);
 
   const [urlInput, setUrlInput] = useState("");
   const [repoInfo, setRepoInfo] = useState<{
@@ -406,6 +489,14 @@ function AnalyzePageContent() {
   const [aiError, setAiError] = useState<string | null>(null);
   const [workLogs, setWorkLogs] = useState<WorkLogEntry[]>([]);
   const [isLogFullscreenOpen, setIsLogFullscreenOpen] = useState(false);
+  const [panelVisibility, setPanelVisibility] = useState<WorkspacePanelVisibility>(
+    DEFAULT_PANEL_VISIBILITY,
+  );
+  const [sidebarWidth, setSidebarWidth] = useState(320);
+  const [fileTreeWidth, setFileTreeWidth] = useState(300);
+  const [overviewWidth, setOverviewWidth] = useState(420);
+  const [activeResizeTarget, setActiveResizeTarget] =
+    useState<ResizeTarget | null>(null);
 
   const createLogEntry = (
     entry: Omit<WorkLogEntry, "id" | "time">,
@@ -815,11 +906,114 @@ function AnalyzePageContent() {
     }
   };
 
+  const stopResizing = useEffectEvent(() => {
+    if (!resizeStateRef.current) {
+      return;
+    }
+
+    resizeStateRef.current = null;
+    setActiveResizeTarget(null);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  });
+
+  const handleResizeMove = useEffectEvent((event: PointerEvent) => {
+    const resizeState = resizeStateRef.current;
+
+    if (!resizeState) {
+      return;
+    }
+
+    const limits = PANEL_LIMITS[resizeState.target];
+    const deltaX =
+      (event.clientX - resizeState.startX) * (resizeState.invertDelta ? -1 : 1);
+    const nextWidth = clampPanelWidth(
+      resizeState.startWidth + deltaX,
+      limits.min,
+      limits.max,
+    );
+
+    switch (resizeState.target) {
+      case "sidebar":
+        setSidebarWidth(nextWidth);
+        break;
+      case "files":
+        setFileTreeWidth(nextWidth);
+        break;
+      case "overview":
+        setOverviewWidth(nextWidth);
+        break;
+      default:
+        break;
+    }
+  });
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => handleResizeMove(event);
+    const onPointerUp = () => stopResizing();
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+  }, []);
+
+  const startResizing = (
+    target: ResizeTarget,
+    event: React.PointerEvent<HTMLButtonElement>,
+    options?: { invertDelta?: boolean },
+  ) => {
+    event.preventDefault();
+
+    const currentWidth =
+      target === "sidebar"
+        ? sidebarWidth
+        : target === "files"
+          ? fileTreeWidth
+          : overviewWidth;
+
+    resizeStateRef.current = {
+      target,
+      startX: event.clientX,
+      startWidth: currentWidth,
+      invertDelta: options?.invertDelta,
+    };
+    setActiveResizeTarget(target);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  const togglePanelVisibility = (panel: WorkspacePanelKey) => {
+    setPanelVisibility((current) => ({
+      ...current,
+      [panel]: !current[panel],
+    }));
+  };
+
+  const isFilesVisible = panelVisibility.files;
+  const isSourceVisible = panelVisibility.source;
+  const isOverviewVisible = panelVisibility.overview;
+  const hasVisibleWorkspacePanel =
+    isFilesVisible || isSourceVisible || isOverviewVisible;
+  const shouldShowFilesResizeHandle = isFilesVisible && isSourceVisible;
+  const shouldFixFilesWidth = shouldShowFilesResizeHandle;
+  const shouldShowOverviewResizeHandle =
+    isOverviewVisible && (isFilesVisible || isSourceVisible);
+  const shouldFixOverviewWidth = shouldShowOverviewResizeHandle;
+
   return (
     <>
       <div className="h-dvh overflow-hidden bg-white dark:bg-gray-950">
-        <div className="flex h-full min-w-[1560px] text-gray-900 dark:text-gray-100">
-        <div className="flex w-[320px] flex-shrink-0 flex-col border-r border-gray-200 bg-gray-50/50 dark:border-gray-800 dark:bg-gray-900/50">
+        <div className="flex h-full min-w-0 text-gray-900 dark:text-gray-100">
+          <div
+            className="flex h-full flex-shrink-0 flex-col bg-gray-50/50 dark:bg-gray-900/50"
+            style={{ width: `${sidebarWidth}px` }}
+          >
           <div className="flex items-center gap-2 border-b border-gray-200 p-4 dark:border-gray-800">
             <Link
               href="/"
@@ -1070,65 +1264,146 @@ function AnalyzePageContent() {
               </div>
             </div>
           )}
-        </div>
-
-        <div className="flex w-[300px] flex-shrink-0 flex-col border-r border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-950">
-          <div className="border-b border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
-            <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">
-              {TEXT.projectFiles}
-            </h2>
-          </div>
-          <div className="relative flex-1 overflow-hidden">
-            {isLoading ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-gray-400">
-                <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
-                <span className="text-sm">{TEXT.loadingTree}</span>
-              </div>
-            ) : fileTree.length > 0 ? (
-              <FileTree
-                nodes={fileTree}
-                onSelectFile={setSelectedFilePath}
-                selectedPath={selectedFilePath}
-              />
-            ) : (
-              <div className="flex h-full items-center justify-center p-4 text-center text-sm text-gray-400">
-                {TEXT.enterValidUrl}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <div className="flex min-w-0 flex-1 overflow-hidden">
-          <div className="w-0 min-w-0 flex-1 overflow-hidden bg-[#1e1e1e]">
-            {repoInfo ? (
-              <CodeViewer
-                owner={repoInfo.owner}
-                repo={repoInfo.repo}
-                branch={repoInfo.branch}
-                path={selectedFilePath}
-              />
-            ) : (
-              <div className="flex h-full flex-col items-center justify-center bg-gray-50 text-gray-500 dark:bg-[#1e1e1e]">
-                <SiGithub className="mb-4 h-16 w-16 text-gray-300 dark:text-gray-700" />
-                <p className="text-lg font-medium text-gray-600 dark:text-gray-400">
-                  {TEXT.noRepoSelected}
-                </p>
-                <p className="mt-2 text-sm text-gray-400">{TEXT.useLeftPanel}</p>
-              </div>
-            )}
           </div>
 
-          <FunctionOverviewPanel
-            overview={aiAnalysis?.functionCallOverview ?? null}
-            selectedFilePath={selectedFilePath}
-            onSelectFile={setSelectedFilePath}
-            isLoading={isAnalyzingAI}
-            emptyMessage={
-              aiAnalysis ? TEXT.functionOverviewUnavailable : TEXT.functionOverviewPending
-            }
+          <ResizeHandle
+            isActive={activeResizeTarget === "sidebar"}
+            onPointerDown={(event) => startResizing("sidebar", event)}
+            label={TEXT.panelDisplay}
           />
+
+          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+            <div className="flex items-center justify-end border-b border-gray-200 bg-white/90 px-4 py-2 backdrop-blur dark:border-gray-800 dark:bg-gray-950/90">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="mr-1 text-xs font-medium text-gray-500 dark:text-gray-400">
+                  {TEXT.panelDisplay}
+                </span>
+                <PanelToggleButton
+                  active={isFilesVisible}
+                  label={TEXT.panelFiles}
+                  onClick={() => togglePanelVisibility("files")}
+                />
+                <PanelToggleButton
+                  active={isSourceVisible}
+                  label={TEXT.panelSource}
+                  onClick={() => togglePanelVisibility("source")}
+                />
+                <PanelToggleButton
+                  active={isOverviewVisible}
+                  label={TEXT.panelOverview}
+                  onClick={() => togglePanelVisibility("overview")}
+                />
+              </div>
+            </div>
+
+            <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+              {isFilesVisible && (
+                <div
+                  className={cn(
+                    "flex h-full min-w-0 flex-col bg-white dark:bg-gray-950",
+                    shouldFixFilesWidth ? "flex-shrink-0" : "flex-1",
+                  )}
+                  style={
+                    shouldFixFilesWidth ? { width: `${fileTreeWidth}px` } : undefined
+                  }
+                >
+                  <div className="border-b border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
+                    <h2 className="text-sm font-semibold text-gray-700 dark:text-gray-300">
+                      {TEXT.projectFiles}
+                    </h2>
+                  </div>
+                  <div className="relative flex-1 overflow-hidden">
+                    {isLoading ? (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-gray-400">
+                        <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
+                        <span className="text-sm">{TEXT.loadingTree}</span>
+                      </div>
+                    ) : fileTree.length > 0 ? (
+                      <FileTree
+                        nodes={fileTree}
+                        onSelectFile={setSelectedFilePath}
+                        selectedPath={selectedFilePath}
+                      />
+                    ) : (
+                      <div className="flex h-full items-center justify-center p-4 text-center text-sm text-gray-400">
+                        {TEXT.enterValidUrl}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {shouldShowFilesResizeHandle && (
+                <ResizeHandle
+                  isActive={activeResizeTarget === "files"}
+                  onPointerDown={(event) => startResizing("files", event)}
+                  label={TEXT.panelFiles}
+                />
+              )}
+
+              {isSourceVisible && (
+                <div className="min-w-0 flex-1 overflow-hidden bg-[#1e1e1e]">
+                  {repoInfo ? (
+                    <CodeViewer
+                      owner={repoInfo.owner}
+                      repo={repoInfo.repo}
+                      branch={repoInfo.branch}
+                      path={selectedFilePath}
+                    />
+                  ) : (
+                    <div className="flex h-full flex-col items-center justify-center bg-gray-50 text-gray-500 dark:bg-[#1e1e1e]">
+                      <SiGithub className="mb-4 h-16 w-16 text-gray-300 dark:text-gray-700" />
+                      <p className="text-lg font-medium text-gray-600 dark:text-gray-400">
+                        {TEXT.noRepoSelected}
+                      </p>
+                      <p className="mt-2 text-sm text-gray-400">{TEXT.useLeftPanel}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {shouldShowOverviewResizeHandle && (
+                <ResizeHandle
+                  isActive={activeResizeTarget === "overview"}
+                  onPointerDown={(event) =>
+                    startResizing("overview", event, { invertDelta: true })
+                  }
+                  label={TEXT.panelOverview}
+                />
+              )}
+
+              {isOverviewVisible && (
+                <div
+                  className={cn(
+                    "flex h-full min-w-0 overflow-hidden",
+                    shouldFixOverviewWidth ? "flex-shrink-0" : "flex-1",
+                  )}
+                  style={
+                    shouldFixOverviewWidth ? { width: `${overviewWidth}px` } : undefined
+                  }
+                >
+                  <FunctionOverviewPanel
+                    overview={aiAnalysis?.functionCallOverview ?? null}
+                    selectedFilePath={selectedFilePath}
+                    onSelectFile={setSelectedFilePath}
+                    isLoading={isAnalyzingAI}
+                    emptyMessage={
+                      aiAnalysis
+                        ? TEXT.functionOverviewUnavailable
+                        : TEXT.functionOverviewPending
+                    }
+                  />
+                </div>
+              )}
+
+              {!hasVisibleWorkspacePanel && (
+                <div className="flex min-w-0 flex-1 items-center justify-center bg-gray-50 px-6 text-center text-sm text-gray-500 dark:bg-gray-950 dark:text-gray-400">
+                  {TEXT.allPanelsHidden}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
-      </div>
       </div>
 
       <WorkLogFullscreenDialog

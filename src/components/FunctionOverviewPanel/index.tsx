@@ -8,8 +8,9 @@ import type { FunctionCallNode, FunctionCallOverview } from "@/types/aiAnalysis"
 
 const CARD_WIDTH = 260;
 const CARD_HEIGHT = 128;
-const HORIZONTAL_GAP = 160;
-const VERTICAL_GAP = 44;
+const NODE_INDENT = 72;
+const CHILDREN_GAP = 32;
+const ROOT_CHILDREN_GAP = 64;
 const SCENE_PADDING = 40;
 const MIN_SCALE = 0.55;
 const MAX_SCALE = 1.8;
@@ -38,17 +39,15 @@ type ViewTransform = {
 type LayoutNode = {
   id: string;
   node: FunctionCallNode;
-  parentId: string | null;
-  depth: number;
   x: number;
   y: number;
-  subtreeHeight: number;
 };
 
 type LayoutResult = {
   nodes: LayoutNode[];
   width: number;
   height: number;
+  connectorX: number;
 };
 
 function getDiveBadge(node: FunctionCallNode) {
@@ -75,70 +74,37 @@ function getDiveBadge(node: FunctionCallNode) {
   };
 }
 
-function measureSubtree(node: FunctionCallNode): number {
-  if (node.children.length === 0) {
-    return CARD_HEIGHT;
+function createLayout(root: FunctionCallNode): LayoutResult {
+  const x = SCENE_PADDING + NODE_INDENT;
+  const nodes: LayoutNode[] = [
+    {
+      id: "root",
+      node: root,
+      x,
+      y: SCENE_PADDING,
+    },
+  ];
+  let nextY = SCENE_PADDING + CARD_HEIGHT;
+
+  if (root.children.length > 0) {
+    nextY += ROOT_CHILDREN_GAP;
   }
 
-  const childrenHeight =
-    node.children.reduce((total, child) => total + measureSubtree(child), 0) +
-    VERTICAL_GAP * Math.max(node.children.length - 1, 0);
-
-  return Math.max(CARD_HEIGHT, childrenHeight);
-}
-
-function createLayout(root: FunctionCallNode): LayoutResult {
-  const nodes: LayoutNode[] = [];
-  let maxDepth = 0;
-  const rootHeight = measureSubtree(root);
-
-  const placeNode = (
-    node: FunctionCallNode,
-    depth: number,
-    top: number,
-    id: string,
-    parentId: string | null,
-  ) => {
-    const subtreeHeight = measureSubtree(node);
-    const x = SCENE_PADDING + depth * (CARD_WIDTH + HORIZONTAL_GAP);
-    const y = top + (subtreeHeight - CARD_HEIGHT) / 2;
-
-    maxDepth = Math.max(maxDepth, depth);
+  root.children.forEach((child, index) => {
     nodes.push({
-      id,
-      node,
-      parentId,
-      depth,
+      id: `root-${index}`,
+      node: child,
       x,
-      y,
-      subtreeHeight,
+      y: nextY,
     });
-
-    if (node.children.length === 0) {
-      return;
-    }
-
-    const childrenHeight =
-      node.children.reduce((total, child) => total + measureSubtree(child), 0) +
-      VERTICAL_GAP * Math.max(node.children.length - 1, 0);
-    let childTop = top + (subtreeHeight - childrenHeight) / 2;
-
-    node.children.forEach((child, index) => {
-      const childHeight = measureSubtree(child);
-      placeNode(child, depth + 1, childTop, `${id}-${index}`, id);
-      childTop += childHeight + VERTICAL_GAP;
-    });
-  };
-
-  placeNode(root, 0, SCENE_PADDING, "root", null);
+    nextY += CARD_HEIGHT + CHILDREN_GAP;
+  });
 
   return {
     nodes,
-    width:
-      SCENE_PADDING * 2 +
-      (maxDepth + 1) * CARD_WIDTH +
-      maxDepth * HORIZONTAL_GAP,
-    height: SCENE_PADDING * 2 + rootHeight,
+    width: x + CARD_WIDTH + SCENE_PADDING,
+    height: (nodes[nodes.length - 1]?.y ?? SCENE_PADDING) + CARD_HEIGHT + SCENE_PADDING,
+    connectorX: SCENE_PADDING + 26,
   };
 }
 
@@ -404,12 +370,8 @@ export function FunctionOverviewPanel({
     });
   };
 
-  const layoutNodeMap = layout
-    ? Object.fromEntries(layout.nodes.map((node) => [node.id, node]))
-    : null;
-
   return (
-    <aside className="flex w-[420px] flex-shrink-0 flex-col border-l border-gray-200 bg-[#f8f5ef] dark:border-gray-800 dark:bg-[#12151c]">
+    <aside className="flex min-w-0 flex-1 flex-col bg-[#f8f5ef] dark:bg-[#12151c]">
       <div className="border-b border-gray-200 bg-white/80 px-4 py-3 backdrop-blur dark:border-gray-800 dark:bg-[#171b22]/90">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -486,7 +448,7 @@ export function FunctionOverviewPanel({
           <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-gray-500 dark:text-gray-400">
             {TEXT.loading}
           </div>
-        ) : !layout || !layoutNodeMap ? (
+        ) : !layout ? (
           <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm leading-6 text-gray-500 dark:text-gray-400">
             {emptyMessage ?? TEXT.empty}
           </div>
@@ -505,27 +467,26 @@ export function FunctionOverviewPanel({
               height={layout.height}
               className="absolute inset-0"
             >
+              {layout.nodes.length > 1 && (
+                <line
+                  x1={layout.connectorX}
+                  y1={layout.nodes[0].y + CARD_HEIGHT / 2}
+                  x2={layout.connectorX}
+                  y2={layout.nodes[layout.nodes.length - 1].y + CARD_HEIGHT / 2}
+                  stroke="rgba(71,85,105,0.58)"
+                  strokeWidth="2"
+                  strokeDasharray="8 8"
+                  strokeLinecap="round"
+                />
+              )}
+
               {layout.nodes.map((node) => {
-                if (!node.parentId) {
-                  return null;
-                }
-
-                const parent = layoutNodeMap[node.parentId];
-
-                if (!parent) {
-                  return null;
-                }
-
-                const startX = parent.x + CARD_WIDTH;
-                const startY = parent.y + CARD_HEIGHT / 2;
-                const midX = parent.x + CARD_WIDTH + HORIZONTAL_GAP / 2;
-                const endX = node.x;
-                const endY = node.y + CARD_HEIGHT / 2;
+                const anchorY = node.y + CARD_HEIGHT / 2;
 
                 return (
                   <path
-                    key={`${parent.id}-${node.id}`}
-                    d={`M ${startX} ${startY} L ${midX} ${startY} L ${midX} ${endY} L ${endX} ${endY}`}
+                    key={`connector-${node.id}`}
+                    d={`M ${layout.connectorX} ${anchorY} L ${node.x - 18} ${anchorY}`}
                     fill="none"
                     stroke="rgba(71,85,105,0.7)"
                     strokeWidth="2"
