@@ -162,6 +162,10 @@ function clampPanelWidth(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
+function getOverviewResizeMax(containerWidth: number): number {
+  return Math.max(PANEL_LIMITS.overview.min, Math.floor(containerWidth * 0.5));
+}
+
 function countFilesInTree(nodes: FileNode[]): number {
   let count = 0;
 
@@ -637,6 +641,7 @@ function AnalyzePageContent() {
   const shouldPersistHistoryRef = useRef(false);
   const logCounterRef = useRef(0);
   const resizeStateRef = useRef<ResizeState | null>(null);
+  const workspacePanelsRef = useRef<HTMLDivElement | null>(null);
 
   const [urlInput, setUrlInput] = useState("");
   const [repoInfo, setRepoInfo] = useState<{
@@ -1416,7 +1421,16 @@ function AnalyzePageContent() {
       return;
     }
 
-    const limits = PANEL_LIMITS[resizeState.target];
+    const baseLimits = PANEL_LIMITS[resizeState.target];
+    const limits =
+      resizeState.target === "overview"
+        ? {
+            ...baseLimits,
+            max: getOverviewResizeMax(
+              workspacePanelsRef.current?.clientWidth ?? window.innerWidth,
+            ),
+          }
+        : baseLimits;
     const deltaX =
       (event.clientX - resizeState.startX) * (resizeState.invertDelta ? -1 : 1);
     const nextWidth = clampPanelWidth(
@@ -1876,7 +1890,10 @@ function AnalyzePageContent() {
               </div>
             </div>
 
-            <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+            <div
+              ref={workspacePanelsRef}
+              className="flex min-h-0 min-w-0 flex-1 overflow-hidden"
+            >
               {isFilesVisible && (
                 <div
                   className={cn(

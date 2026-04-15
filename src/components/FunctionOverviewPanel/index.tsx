@@ -358,11 +358,11 @@ const FunctionNodeCard = memo(function FunctionNodeCard({
       )}
     >
       <div
-        className="border-b-2 px-4 py-2 text-[11px] font-medium tracking-wide"
+        className="border-b-2 px-4 py-2 text-[15px] font-medium tracking-wide"
         style={{
           borderColor: moduleColor.border,
           backgroundColor: moduleColor.soft,
-          color: moduleColor.text,
+          color: "#000000",
         }}
       >
         <span className="block truncate" title={node.filePath ?? TEXT.noFile}>
