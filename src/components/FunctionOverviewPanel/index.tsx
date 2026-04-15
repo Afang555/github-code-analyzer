@@ -1,8 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronDown,
+  ChevronRight,
   GitBranch,
+  Loader2,
   Maximize2,
   Minimize2,
   Minus,
@@ -16,6 +19,7 @@ import {
   getFunctionModuleColor,
   type FunctionModuleColor,
 } from "@/lib/functionModules";
+import { getFunctionCallNodeRouteLabel } from "@/lib/functionCallBridgeUtils";
 import { cn } from "@/lib/utils";
 import type {
   FunctionCallNode,
@@ -24,13 +28,14 @@ import type {
 } from "@/types/aiAnalysis";
 
 const CARD_WIDTH = 272;
-const CARD_HEIGHT = 136;
+const CARD_HEIGHT = 156;
 const COLUMN_GAP = 128;
 const VERTICAL_GAP = 28;
 const SCENE_PADDING = 40;
 const ELBOW_OFFSET = 42;
 const MIN_SCALE = 0.45;
 const MAX_SCALE = 1.8;
+const NODE_CONTROL_OVERFLOW = 34;
 
 const TEXT = {
   title: "函数全景图",
@@ -43,6 +48,12 @@ const TEXT = {
   dragHint: "拖拽平移，滚轮缩放",
   fullscreen: "全屏",
   exitFullscreen: "退出全屏",
+  expandAll: "全部展开",
+  collapseAll: "全部收起",
+  expandNode: "展开子节点",
+  collapseNode: "收起子节点",
+  continueDive: "继续下钻",
+  drillingDive: "下钻中",
   noFile: "文件待确认",
   needDive: "建议下钻",
   maybeDive: "待确认",
@@ -137,10 +148,13 @@ function layoutSubtree(
   node: FunctionCallNode,
   depth: number,
   id: string,
+  expandedNodeIds: Set<string>,
 ): SubtreeLayout {
   const x = SCENE_PADDING + depth * (CARD_WIDTH + COLUMN_GAP);
+  const visibleChildren =
+    node.children.length > 0 && expandedNodeIds.has(id) ? node.children : [];
 
-  if (node.children.length === 0) {
+  if (visibleChildren.length === 0) {
     return {
       rootId: id,
       nodes: [
@@ -160,8 +174,8 @@ function layoutSubtree(
     };
   }
 
-  const childLayouts = node.children.map((child, index) =>
-    layoutSubtree(child, depth + 1, `${id}-${index}`),
+  const childLayouts = visibleChildren.map((child, index) =>
+    layoutSubtree(child, depth + 1, `${id}-${index}`, expandedNodeIds),
   );
   const childrenHeight =
     childLayouts.reduce((total, childLayout) => total + childLayout.height, 0) +
@@ -212,8 +226,11 @@ function layoutSubtree(
   };
 }
 
-function createLayout(root: FunctionCallNode): LayoutResult {
-  const subtree = layoutSubtree(root, 0, "root");
+function createLayout(
+  root: FunctionCallNode,
+  expandedNodeIds: Set<string>,
+): LayoutResult {
+  const subtree = layoutSubtree(root, 0, "root", expandedNodeIds);
 
   return {
     nodes: subtree.nodes.map((node) => ({
@@ -226,7 +243,7 @@ function createLayout(root: FunctionCallNode): LayoutResult {
       toY: edge.toY + SCENE_PADDING,
     })),
     width: subtree.maxX + SCENE_PADDING,
-    height: subtree.height + SCENE_PADDING * 2,
+    height: subtree.height + SCENE_PADDING * 2 + NODE_CONTROL_OVERFLOW,
   };
 }
 
@@ -242,26 +259,75 @@ function createOverviewSignature(root: FunctionCallNode): string {
   return `${root.name}-${root.filePath ?? "unknown"}-${countNodes(root)}`;
 }
 
-function FunctionNodeCard({
-  node,
-  depth,
-  isSelected,
-  isDimmed,
-  isModuleMatch,
-  moduleColor,
-  onSelectFile,
-}: {
+function collectExpandableNodeIds(
+  root: FunctionCallNode,
+): Set<string> {
+  const result = new Set<string>();
+
+  const visit = (node: FunctionCallNode, nodeId: string) => {
+    if (node.children.length > 0) {
+      result.add(nodeId);
+    }
+
+    for (const [childIndex, child] of node.children.entries()) {
+      visit(child, `${nodeId}-${childIndex}`);
+    }
+  };
+
+  visit(root, "root");
+  return result;
+}
+
+function parseLayoutNodePath(id: string): number[] | null {
+  if (id === "root") {
+    return [];
+  }
+
+  if (!id.startsWith("root-")) {
+    return null;
+  }
+
+  const segments = id.split("-").slice(1);
+  const path: number[] = [];
+
+  for (const segment of segments) {
+    const index = Number.parseInt(segment, 10);
+
+    if (!Number.isInteger(index) || index < 0) {
+      return null;
+    }
+
+    path.push(index);
+  }
+
+  return path;
+}
+
+type FunctionNodeCardProps = {
   node: FunctionCallNode;
   depth: number;
   isSelected: boolean;
   isDimmed: boolean;
   isModuleMatch: boolean;
+  isInteracting: boolean;
   moduleColor: FunctionModuleColor;
   onSelectFile?: (path: string) => void;
-}) {
+};
+
+const FunctionNodeCard = memo(function FunctionNodeCard({
+  node,
+  depth,
+  isSelected,
+  isDimmed,
+  isModuleMatch,
+  isInteracting,
+  moduleColor,
+  onSelectFile,
+}: FunctionNodeCardProps) {
   const badge = getDiveBadge(node);
   const canOpenFile = Boolean(node.filePath);
   const isRoot = depth === 0;
+  const routeLabel = getFunctionCallNodeRouteLabel(node);
 
   return (
     <button
@@ -274,15 +340,21 @@ function FunctionNodeCard({
       }}
       disabled={!canOpenFile}
       className={cn(
-        "flex h-[136px] w-[272px] flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left shadow-[0_10px_24px_rgba(15,23,42,0.12)] transition-[transform,opacity,filter,box-shadow] dark:border-slate-100 dark:bg-[#191c22]",
-        canOpenFile && "cursor-pointer hover:-translate-y-0.5",
+        "function-node-card flex h-[156px] w-[272px] flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left transition-[transform,opacity,filter,box-shadow] dark:border-slate-100 dark:bg-[#191c22]",
+        isInteracting
+          ? "shadow-none transition-none"
+          : "shadow-[0_10px_24px_rgba(15,23,42,0.12)]",
+        canOpenFile && !isInteracting && "cursor-pointer hover:-translate-y-0.5",
+        canOpenFile && isInteracting && "cursor-pointer",
         !canOpenFile && "cursor-default",
         isRoot &&
-          "border-blue-700 shadow-[0_14px_26px_rgba(29,78,216,0.18)] dark:border-blue-300",
+          (isInteracting
+            ? "border-blue-700 dark:border-blue-300"
+            : "border-blue-700 shadow-[0_14px_26px_rgba(29,78,216,0.18)] dark:border-blue-300"),
         isModuleMatch && "ring-4 ring-amber-200/70 dark:ring-amber-500/40",
         isSelected &&
           "ring-4 ring-blue-200/70 dark:border-blue-300 dark:ring-blue-500/30",
-        isDimmed && "opacity-30 saturate-0",
+        isDimmed && (isInteracting ? "opacity-45" : "opacity-30 saturate-0"),
       )}
     >
       <div
@@ -298,7 +370,7 @@ function FunctionNodeCard({
         </span>
       </div>
 
-      <div className="flex flex-1 flex-col gap-2.5 px-4 py-3">
+      <div className="flex flex-1 flex-col gap-2 px-4 py-3">
         <div className="relative min-h-[22px] pr-[74px]">
           <h3
             className={cn(
@@ -319,11 +391,25 @@ function FunctionNodeCard({
           </span>
         </div>
 
+        {routeLabel && (
+          <div className="flex items-center gap-2">
+            <span className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-700 dark:border-sky-800/60 dark:bg-sky-900/30 dark:text-sky-300">
+              URL
+            </span>
+            <p
+              className="truncate font-mono text-[11px] text-sky-700 dark:text-sky-300"
+              title={routeLabel}
+            >
+              {routeLabel}
+            </p>
+          </div>
+        )}
+
         <p
           className="text-sm leading-6 text-slate-700 dark:text-slate-200"
           style={{
             display: "-webkit-box",
-            WebkitLineClamp: 2,
+            WebkitLineClamp: routeLabel ? 2 : 3,
             WebkitBoxOrient: "vertical",
             overflow: "hidden",
           }}
@@ -334,7 +420,7 @@ function FunctionNodeCard({
       </div>
     </button>
   );
-}
+});
 
 export function FunctionOverviewPanel({
   overview,
@@ -342,6 +428,8 @@ export function FunctionOverviewPanel({
   activeModuleId = null,
   selectedFilePath,
   onSelectFile,
+  onDrillDownNode,
+  drillingNodeId = null,
   isLoading = false,
   emptyMessage,
 }: {
@@ -350,12 +438,16 @@ export function FunctionOverviewPanel({
   activeModuleId?: string | null;
   selectedFilePath?: string;
   onSelectFile?: (path: string) => void;
+  onDrillDownNode?: (nodePath: number[], nodeId: string) => void;
+  drillingNodeId?: string | null;
   isLoading?: boolean;
   emptyMessage?: string;
 }) {
   const rootRef = useRef<HTMLElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<HTMLDivElement | null>(null);
+  const pendingTransformRef = useRef<ViewTransform | null>(null);
+  const transformFrameRef = useRef<number | null>(null);
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -369,6 +461,7 @@ export function FunctionOverviewPanel({
     scale: 1,
   });
   const commitTimerRef = useRef<number | null>(null);
+  const interactionTimerRef = useRef<number | null>(null);
 
   const [transform, setTransform] = useState<ViewTransform>({
     x: 0,
@@ -376,8 +469,44 @@ export function FunctionOverviewPanel({
     scale: 1,
   });
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isInteracting, setIsInteracting] = useState(false);
+  const [expandedNodeState, setExpandedNodeState] = useState<{
+    signature: string;
+    ids: Set<string>;
+  }>(() => ({
+    signature: "empty",
+    ids: new Set<string>(),
+  }));
+  const overviewRoot = overview?.root ?? null;
+  const overviewDepth = overview?.analyzedDepth ?? 0;
 
-  const layout = overview?.root ? createLayout(overview.root) : null;
+  const overviewSignature = useMemo(
+    () =>
+      overviewRoot
+        ? `${createOverviewSignature(overviewRoot)}-${overviewDepth}`
+        : "empty",
+    [overviewDepth, overviewRoot],
+  );
+  const expandableNodeIds = useMemo(
+    () =>
+      overviewRoot ? collectExpandableNodeIds(overviewRoot) : new Set<string>(),
+    [overviewRoot],
+  );
+  const expandedNodeIds = useMemo(() => {
+    if (!overviewRoot) {
+      return new Set<string>();
+    }
+
+    if (expandedNodeState.signature !== overviewSignature) {
+      return new Set(expandableNodeIds);
+    }
+
+    return expandedNodeState.ids;
+  }, [expandableNodeIds, expandedNodeState, overviewRoot, overviewSignature]);
+  const layout = useMemo(
+    () => (overviewRoot ? createLayout(overviewRoot, expandedNodeIds) : null),
+    [expandedNodeIds, overviewRoot],
+  );
   const moduleColorMap = useMemo(
     () => buildFunctionModuleColorMap(modules),
     [modules],
@@ -386,22 +515,92 @@ export function FunctionOverviewPanel({
     () => new Map(layout?.nodes.map((item) => [item.id, item] as const) ?? []),
     [layout],
   );
-  const hasOverview = Boolean(overview?.root);
+  const hasOverview = Boolean(overviewRoot);
+  const hasExpandableNodes = expandableNodeIds.size > 0;
+  const allNodesExpanded = useMemo(() => {
+    if (!hasExpandableNodes) {
+      return false;
+    }
+
+    for (const nodeId of expandableNodeIds) {
+      if (!expandedNodeIds.has(nodeId)) {
+        return false;
+      }
+    }
+
+    return true;
+  }, [expandableNodeIds, expandedNodeIds, hasExpandableNodes]);
   const sceneWidth = layout?.width ?? 0;
   const sceneHeight = layout?.height ?? 0;
-  const overviewSignature = overview?.root
-    ? `${createOverviewSignature(overview.root)}-${overview.analyzedDepth}`
-    : "empty";
 
-  const applySceneTransform = (nextTransform: ViewTransform) => {
-    transformRef.current = nextTransform;
-
+  const writeSceneTransform = useCallback((nextTransform: ViewTransform) => {
     if (sceneRef.current) {
-      sceneRef.current.style.transform = `translate(${nextTransform.x}px, ${nextTransform.y}px) scale(${nextTransform.scale})`;
+      sceneRef.current.style.transform = `translate3d(${nextTransform.x}px, ${nextTransform.y}px, 0) scale(${nextTransform.scale})`;
     }
-  };
+  }, []);
 
-  const commitSceneTransform = (nextTransform?: ViewTransform) => {
+  const applySceneTransform = useCallback(
+    (nextTransform: ViewTransform) => {
+      transformRef.current = nextTransform;
+      pendingTransformRef.current = null;
+
+      if (transformFrameRef.current !== null) {
+        window.cancelAnimationFrame(transformFrameRef.current);
+        transformFrameRef.current = null;
+      }
+
+      writeSceneTransform(nextTransform);
+    },
+    [writeSceneTransform],
+  );
+
+  const flushScheduledSceneTransform = useCallback(() => {
+    transformFrameRef.current = null;
+    const nextTransform = pendingTransformRef.current ?? transformRef.current;
+    pendingTransformRef.current = null;
+    writeSceneTransform(nextTransform);
+  }, [writeSceneTransform]);
+
+  const scheduleSceneTransform = useCallback(
+    (nextTransform: ViewTransform) => {
+      transformRef.current = nextTransform;
+      pendingTransformRef.current = nextTransform;
+
+      if (transformFrameRef.current !== null) {
+        return;
+      }
+
+      transformFrameRef.current = window.requestAnimationFrame(
+        flushScheduledSceneTransform,
+      );
+    },
+    [flushScheduledSceneTransform],
+  );
+
+  const clearInteractionTimer = useCallback(() => {
+    if (interactionTimerRef.current !== null) {
+      window.clearTimeout(interactionTimerRef.current);
+      interactionTimerRef.current = null;
+    }
+  }, []);
+
+  const beginInteraction = useCallback(() => {
+    clearInteractionTimer();
+    setIsInteracting(true);
+  }, [clearInteractionTimer]);
+
+  const scheduleInteractionEnd = useCallback(
+    (delay = 120) => {
+      clearInteractionTimer();
+      interactionTimerRef.current = window.setTimeout(() => {
+        interactionTimerRef.current = null;
+        setIsInteracting(false);
+      }, delay);
+    },
+    [clearInteractionTimer],
+  );
+
+  const commitSceneTransform = useCallback((nextTransform?: ViewTransform) => {
     if (nextTransform) {
       applySceneTransform(nextTransform);
     }
@@ -412,9 +611,9 @@ export function FunctionOverviewPanel({
     }
 
     setTransform(transformRef.current);
-  };
+  }, [applySceneTransform]);
 
-  const scheduleSceneTransformCommit = () => {
+  const scheduleSceneTransformCommit = useCallback(() => {
     if (commitTimerRef.current !== null) {
       window.clearTimeout(commitTimerRef.current);
     }
@@ -423,7 +622,202 @@ export function FunctionOverviewPanel({
       commitTimerRef.current = null;
       setTransform(transformRef.current);
     }, 80);
-  };
+  }, []);
+
+  const toggleNodeExpandState = useCallback(
+    (nodeId: string) => {
+      if (!overviewRoot) {
+        return;
+      }
+
+      setExpandedNodeState((previous) => {
+        const nextIds =
+          previous.signature === overviewSignature
+            ? new Set(previous.ids)
+            : new Set(expandableNodeIds);
+
+        if (nextIds.has(nodeId)) {
+          nextIds.delete(nodeId);
+        } else {
+          nextIds.add(nodeId);
+        }
+
+        return {
+          signature: overviewSignature,
+          ids: nextIds,
+        };
+      });
+    },
+    [expandableNodeIds, overviewRoot, overviewSignature],
+  );
+
+  const expandAllNodes = useCallback(() => {
+    if (!overviewRoot) {
+      return;
+    }
+
+    setExpandedNodeState({
+      signature: overviewSignature,
+      ids: new Set(expandableNodeIds),
+    });
+  }, [expandableNodeIds, overviewRoot, overviewSignature]);
+
+  const collapseAllNodes = useCallback(() => {
+    if (!overviewRoot) {
+      return;
+    }
+
+    setExpandedNodeState({
+      signature: overviewSignature,
+      ids: new Set<string>(),
+    });
+  }, [overviewRoot, overviewSignature]);
+
+  const renderedEdges = useMemo(() => {
+    if (!layout) {
+      return null;
+    }
+
+    return layout.edges.map((edge) => {
+      const elbowX = edge.fromX + ELBOW_OFFSET;
+      const fromNode = layoutNodeMap.get(edge.fromNodeId);
+      const toNode = layoutNodeMap.get(edge.toNodeId);
+      const fromModuleId = fromNode?.node.moduleId ?? null;
+      const toModuleId = toNode?.node.moduleId ?? null;
+      const isEdgeHighlighted =
+        !activeModuleId ||
+        (fromModuleId === activeModuleId && toModuleId === activeModuleId);
+
+      return (
+        <path
+          key={edge.id}
+          d={`M ${edge.fromX} ${edge.fromY} H ${elbowX} V ${edge.toY} H ${edge.toX}`}
+          fill="none"
+          stroke={
+            isInteracting
+              ? isEdgeHighlighted
+                ? "rgba(51,65,85,0.66)"
+                : "rgba(148,163,184,0.22)"
+              : isEdgeHighlighted
+                ? "rgba(51,65,85,0.8)"
+                : "rgba(148,163,184,0.28)"
+          }
+          strokeWidth={isInteracting ? 1.6 : isEdgeHighlighted ? 2.2 : 1.8}
+          strokeDasharray={isInteracting ? undefined : isEdgeHighlighted ? "7 7" : "5 8"}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      );
+    });
+  }, [activeModuleId, isInteracting, layout, layoutNodeMap]);
+
+  const renderedNodes = useMemo(() => {
+    if (!layout) {
+      return null;
+    }
+
+    return layout.nodes.map((layoutNode) => {
+      const moduleColor = getFunctionModuleColor(
+        layoutNode.node.moduleId,
+        moduleColorMap,
+      );
+      const isDimmed =
+        Boolean(activeModuleId) && layoutNode.node.moduleId !== activeModuleId;
+      const isModuleMatch =
+        Boolean(activeModuleId) && layoutNode.node.moduleId === activeModuleId;
+      const hasChildren = layoutNode.node.children.length > 0;
+      const isExpanded = expandedNodeIds.has(layoutNode.id);
+      const canContinueDive = !hasChildren && Boolean(onDrillDownNode);
+      const isDrilling = drillingNodeId === layoutNode.id;
+      const nodePath = parseLayoutNodePath(layoutNode.id);
+
+      return (
+        <div
+          key={layoutNode.id}
+          className="absolute"
+          style={{
+            left: `${layoutNode.x}px`,
+            top: `${layoutNode.y}px`,
+          }}
+        >
+          <div className="relative h-[156px] w-[272px]">
+            <FunctionNodeCard
+              node={layoutNode.node}
+              depth={layoutNode.depth}
+              isSelected={
+                Boolean(layoutNode.node.filePath) &&
+                layoutNode.node.filePath === selectedFilePath
+              }
+              isDimmed={isDimmed}
+              isModuleMatch={isModuleMatch}
+              isInteracting={isInteracting}
+              moduleColor={moduleColor}
+              onSelectFile={onSelectFile}
+            />
+
+            {hasChildren && (
+              <button
+                type="button"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggleNodeExpandState(layoutNode.id);
+                }}
+                className="absolute h-8 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border border-slate-300 bg-white text-slate-700 shadow-sm transition-colors hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                style={{
+                  left: "50%",
+                  top: "100%",
+                }}
+                aria-label={isExpanded ? TEXT.collapseNode : TEXT.expandNode}
+                title={isExpanded ? TEXT.collapseNode : TEXT.expandNode}
+              >
+                {isExpanded ? (
+                  <ChevronDown className="mx-auto h-4 w-4" />
+                ) : (
+                  <ChevronRight className="mx-auto h-4 w-4" />
+                )}
+              </button>
+            )}
+
+            {canContinueDive && nodePath && (
+              <button
+                type="button"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onDrillDownNode?.(nodePath, layoutNode.id);
+                }}
+                disabled={isDrilling}
+                className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-blue-300 bg-blue-50 px-3 py-1 text-[11px] font-medium text-blue-700 shadow-sm transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-70 dark:border-blue-700 dark:bg-blue-900/40 dark:text-blue-200 dark:hover:bg-blue-900/60"
+                style={{
+                  left: "50%",
+                  top: "100%",
+                }}
+                aria-label={TEXT.continueDive}
+                title={TEXT.continueDive}
+              >
+                <span className="inline-flex items-center gap-1">
+                  {isDrilling && <Loader2 className="h-3 w-3 animate-spin" />}
+                  {isDrilling ? TEXT.drillingDive : TEXT.continueDive}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    });
+  }, [
+    activeModuleId,
+    drillingNodeId,
+    expandedNodeIds,
+    isInteracting,
+    layout,
+    moduleColorMap,
+    onDrillDownNode,
+    onSelectFile,
+    selectedFilePath,
+    toggleNodeExpandState,
+  ]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -457,9 +851,7 @@ export function FunctionOverviewPanel({
 
       transformRef.current = nextTransform;
 
-      if (sceneRef.current) {
-        sceneRef.current.style.transform = `translate(${nextTransform.x}px, ${nextTransform.y}px) scale(${nextTransform.scale})`;
-      }
+      writeSceneTransform(nextTransform);
 
       setTransform(nextTransform);
     };
@@ -474,13 +866,25 @@ export function FunctionOverviewPanel({
 
     return () => {
       window.cancelAnimationFrame(frameId);
+      if (transformFrameRef.current !== null) {
+        window.cancelAnimationFrame(transformFrameRef.current);
+        transformFrameRef.current = null;
+      }
       if (commitTimerRef.current !== null) {
         window.clearTimeout(commitTimerRef.current);
         commitTimerRef.current = null;
       }
+      clearInteractionTimer();
       observer.disconnect();
     };
-  }, [hasOverview, overviewSignature, sceneHeight, sceneWidth]);
+  }, [
+    clearInteractionTimer,
+    hasOverview,
+    overviewSignature,
+    sceneHeight,
+    sceneWidth,
+    writeSceneTransform,
+  ]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -519,6 +923,7 @@ export function FunctionOverviewPanel({
       return;
     }
 
+    beginInteraction();
     dragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -537,7 +942,7 @@ export function FunctionOverviewPanel({
       return;
     }
 
-    applySceneTransform({
+    scheduleSceneTransform({
       ...transformRef.current,
       x: dragState.originX + event.clientX - dragState.startX,
       y: dragState.originY + event.clientY - dragState.startY,
@@ -549,6 +954,7 @@ export function FunctionOverviewPanel({
       dragRef.current = null;
       event.currentTarget.releasePointerCapture(event.pointerId);
       commitSceneTransform();
+      scheduleInteractionEnd(80);
     }
   };
 
@@ -558,6 +964,7 @@ export function FunctionOverviewPanel({
     }
 
     event.preventDefault();
+    beginInteraction();
 
     const rect = event.currentTarget.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;
@@ -570,12 +977,13 @@ export function FunctionOverviewPanel({
     );
     const scaleRatio = nextScale / current.scale;
 
-    applySceneTransform({
+    scheduleSceneTransform({
       scale: nextScale,
       x: pointerX - (pointerX - current.x) * scaleRatio,
       y: pointerY - (pointerY - current.y) * scaleRatio,
     });
     scheduleSceneTransformCommit();
+    scheduleInteractionEnd(140);
   };
 
   const resetView = () => {
@@ -636,6 +1044,26 @@ export function FunctionOverviewPanel({
           <div className="flex items-center gap-1">
             <button
               type="button"
+              onClick={expandAllNodes}
+              disabled={!hasExpandableNodes || allNodesExpanded}
+              className="rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700 dark:bg-[#1b1f27] dark:text-gray-300 dark:hover:bg-[#222733]"
+              aria-label={TEXT.expandAll}
+              title={TEXT.expandAll}
+            >
+              {TEXT.expandAll}
+            </button>
+            <button
+              type="button"
+              onClick={collapseAllNodes}
+              disabled={!hasExpandableNodes || expandedNodeIds.size === 0}
+              className="rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-600 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700 dark:bg-[#1b1f27] dark:text-gray-300 dark:hover:bg-[#222733]"
+              aria-label={TEXT.collapseAll}
+              title={TEXT.collapseAll}
+            >
+              {TEXT.collapseAll}
+            </button>
+            <button
+              type="button"
               onClick={() => adjustScale(transformRef.current.scale - 0.1)}
               className="rounded-md border border-gray-200 bg-white p-1.5 text-gray-600 transition-colors hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1b1f27] dark:text-gray-300 dark:hover:bg-[#222733]"
               aria-label={TEXT.zoomOut}
@@ -688,7 +1116,7 @@ export function FunctionOverviewPanel({
       <div
         ref={containerRef}
         className={cn(
-          "relative flex-1 touch-none overflow-hidden",
+          "relative flex-1 touch-none select-none overflow-hidden",
           layout && "cursor-grab active:cursor-grabbing",
         )}
         onPointerDown={handlePointerDown}
@@ -721,82 +1149,24 @@ export function FunctionOverviewPanel({
             style={{
               width: `${layout.width}px`,
               height: `${layout.height}px`,
-              transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
+              transform: `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`,
               transformOrigin: "0 0",
               willChange: "transform",
+              contain: "layout paint style",
+              backfaceVisibility: "hidden",
+              pointerEvents: isInteracting ? "none" : "auto",
             }}
           >
             <svg
               width={layout.width}
               height={layout.height}
               className="absolute inset-0"
+              style={{ pointerEvents: "none" }}
             >
-              {layout.edges.map((edge) => {
-                const elbowX = edge.fromX + ELBOW_OFFSET;
-                const fromNode = layoutNodeMap.get(edge.fromNodeId);
-                const toNode = layoutNodeMap.get(edge.toNodeId);
-                const fromModuleId = fromNode?.node.moduleId ?? null;
-                const toModuleId = toNode?.node.moduleId ?? null;
-                const isEdgeHighlighted =
-                  !activeModuleId ||
-                  (fromModuleId === activeModuleId &&
-                    toModuleId === activeModuleId);
-
-                return (
-                  <path
-                    key={edge.id}
-                    d={`M ${edge.fromX} ${edge.fromY} H ${elbowX} V ${edge.toY} H ${edge.toX}`}
-                    fill="none"
-                    stroke={
-                      isEdgeHighlighted
-                        ? "rgba(51,65,85,0.8)"
-                        : "rgba(148,163,184,0.28)"
-                    }
-                    strokeWidth={isEdgeHighlighted ? 2.2 : 1.8}
-                    strokeDasharray={isEdgeHighlighted ? "7 7" : "5 8"}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                );
-              })}
+              {renderedEdges}
             </svg>
 
-            {layout.nodes.map((layoutNode) => {
-              const moduleColor = getFunctionModuleColor(
-                layoutNode.node.moduleId,
-                moduleColorMap,
-              );
-              const isDimmed =
-                Boolean(activeModuleId) &&
-                layoutNode.node.moduleId !== activeModuleId;
-              const isModuleMatch =
-                Boolean(activeModuleId) &&
-                layoutNode.node.moduleId === activeModuleId;
-
-              return (
-                <div
-                  key={layoutNode.id}
-                  className="absolute"
-                  style={{
-                    left: `${layoutNode.x}px`,
-                    top: `${layoutNode.y}px`,
-                  }}
-                >
-                  <FunctionNodeCard
-                    node={layoutNode.node}
-                    depth={layoutNode.depth}
-                    isSelected={
-                      Boolean(layoutNode.node.filePath) &&
-                      layoutNode.node.filePath === selectedFilePath
-                    }
-                    isDimmed={isDimmed}
-                    isModuleMatch={isModuleMatch}
-                    moduleColor={moduleColor}
-                    onSelectFile={onSelectFile}
-                  />
-                </div>
-              );
-            })}
+            {renderedNodes}
           </div>
         )}
       </div>

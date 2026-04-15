@@ -2,6 +2,7 @@
 
 import {
   Suspense,
+  useCallback,
   useEffect,
   useEffectEvent,
   useMemo,
@@ -34,6 +35,7 @@ import {
   buildFunctionModuleColorMap,
   getFunctionModuleColor,
 } from "@/lib/functionModules";
+import { getFunctionCallNodeRouteLabel } from "@/lib/functionCallBridgeUtils";
 import { stringifyJsonPreview } from "@/lib/jsonPreview";
 import { collectAnalysisCandidatePaths } from "@/lib/repositoryAnalysis";
 import { cn } from "@/lib/utils";
@@ -43,6 +45,8 @@ import {
   type FileNode,
 } from "@/services/githubService";
 import {
+  isAnalyzeRepoDrillDownErrorResponse,
+  isAnalyzeRepoDrillDownSuccessResponse,
   isAnalyzeRepoErrorResponse,
   isAnalyzeRepoSuccessResponse,
   type AIAnalysisResult,
@@ -262,6 +266,7 @@ function summarizeFunctionOverview(overview: FunctionCallOverview | null): strin
 function collectFunctionDescendants(root: FunctionCallNode, limit = 6): FunctionCallNode[] {
   const queue = [...root.children];
   const nodes: FunctionCallNode[] = [];
+  const seen = new Set<string>();
 
   while (queue.length > 0 && nodes.length < limit) {
     const current = queue.shift();
@@ -270,6 +275,15 @@ function collectFunctionDescendants(root: FunctionCallNode, limit = 6): Function
       continue;
     }
 
+    const routeLabel = getFunctionCallNodeRouteLabel(current) ?? "";
+    const identity = `${current.name}::${current.filePath ?? "__unknown__"}::${routeLabel}`;
+
+    if (seen.has(identity)) {
+      queue.push(...current.children);
+      continue;
+    }
+
+    seen.add(identity);
     nodes.push(current);
     queue.push(...current.children);
   }
@@ -303,6 +317,32 @@ function collectFunctionModuleNodeCounts(
   }
 
   return counts;
+}
+
+function getFunctionNodeByPath(
+  root: FunctionCallNode | null,
+  nodePath: number[],
+): FunctionCallNode | null {
+  if (!root) {
+    return null;
+  }
+
+  let current: FunctionCallNode = root;
+
+  for (const childIndex of nodePath) {
+    if (!Number.isInteger(childIndex) || childIndex < 0) {
+      return null;
+    }
+
+    const next = current.children[childIndex];
+    if (!next) {
+      return null;
+    }
+
+    current = next;
+  }
+
+  return current;
 }
 
 function getEntryReviewLogLevel(
@@ -616,6 +656,7 @@ function AnalyzePageContent() {
   const [aiError, setAiError] = useState<string | null>(null);
   const [workLogs, setWorkLogs] = useState<WorkLogEntry[]>([]);
   const [isLogFullscreenOpen, setIsLogFullscreenOpen] = useState(false);
+  const [drillingNodeId, setDrillingNodeId] = useState<string | null>(null);
   const [panelVisibility, setPanelVisibility] = useState<WorkspacePanelVisibility>(
     DEFAULT_PANEL_VISIBILITY,
   );
@@ -909,6 +950,7 @@ function AnalyzePageContent() {
     setSelectedFilePath(preferredFilePath);
     setAiAnalysis(history.analysisResult);
     setActiveModuleId(null);
+    setDrillingNodeId(null);
     setWorkLogs(history.workLogs);
 
     autoAnalyzedRepoRef.current = `${history.owner}/${history.repo}`;
@@ -935,6 +977,7 @@ function AnalyzePageContent() {
     setIsLoading(true);
     setError(null);
     setAiError(null);
+    setDrillingNodeId(null);
     setFileTree([]);
     setSelectedFilePath("");
     setRepoInfo(null);
@@ -1165,40 +1208,54 @@ function AnalyzePageContent() {
     handleAutoAnalyze(normalizedUrl);
   }, [searchParams]);
 
-  const persistCurrentAnalysisHistory = useEffectEvent(() => {
+  const persistHistorySnapshot = useCallback(
+    (
+      analysisResultToPersist: AIAnalysisResult | null,
+      logsToPersist: WorkLogEntry[],
+    ): boolean => {
+      if (!repoInfo || isLoading || isAnalyzingAI) {
+        return false;
+      }
+
+      const fileList = flattenFileTreePaths(fileTree);
+      if (fileList.length === 0) {
+        return false;
+      }
+
+      const historyRecord = createAnalysisHistoryRecord({
+        repoInfo: {
+          owner: repoInfo.owner,
+          repo: repoInfo.repo,
+          branch: repoInfo.branch,
+          repositoryUrl: repoInfo.repositoryUrl,
+          description: repoInfo.description,
+        },
+        fileList,
+        analysisResult: analysisResultToPersist,
+        workLogs: logsToPersist,
+      });
+
+      upsertAnalysisHistoryRecord(historyRecord);
+      return true;
+    },
+    [fileTree, isAnalyzingAI, isLoading, repoInfo],
+  );
+
+  const persistCurrentAnalysisHistory = useCallback(() => {
     if (!shouldPersistHistoryRef.current) {
       return;
     }
 
-    if (!repoInfo || isLoading || isAnalyzingAI) {
+    if (!persistHistorySnapshot(aiAnalysis, workLogs)) {
       return;
     }
 
-    const fileList = flattenFileTreePaths(fileTree);
-    if (fileList.length === 0) {
-      return;
-    }
-
-    const historyRecord = createAnalysisHistoryRecord({
-      repoInfo: {
-        owner: repoInfo.owner,
-        repo: repoInfo.repo,
-        branch: repoInfo.branch,
-        repositoryUrl: repoInfo.repositoryUrl,
-        description: repoInfo.description,
-      },
-      fileList,
-      analysisResult: aiAnalysis,
-      workLogs,
-    });
-
-    upsertAnalysisHistoryRecord(historyRecord);
     shouldPersistHistoryRef.current = false;
-  });
+  }, [aiAnalysis, persistHistorySnapshot, workLogs]);
 
   useEffect(() => {
     persistCurrentAnalysisHistory();
-  }, [repoInfo, fileTree, aiAnalysis, workLogs, isLoading, isAnalyzingAI]);
+  }, [persistCurrentAnalysisHistory]);
 
   useEffect(() => {
     if (!activeModuleId) {
@@ -1224,6 +1281,120 @@ function AnalyzePageContent() {
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       handleAnalyzeClick();
+    }
+  };
+
+  const handleManualDrillDown = async (nodePath: number[], nodeId: string) => {
+    if (drillingNodeId || isLoading || isAnalyzingAI) {
+      return;
+    }
+
+    if (!repoInfo || !aiAnalysis) {
+      return;
+    }
+
+    const targetNode = getFunctionNodeByPath(
+      aiAnalysis.functionCallOverview?.root ?? null,
+      nodePath,
+    );
+
+    if (!targetNode) {
+      appendLog({
+        level: "error",
+        title: "手动下钻失败",
+        message: "未找到目标节点，请刷新后重试。",
+      });
+      return;
+    }
+
+    const filePaths = flattenFileTreePaths(fileTree);
+    if (filePaths.length === 0) {
+      appendLog({
+        level: "warning",
+        title: "手动下钻已跳过",
+        message: "当前没有可用于分析的文件列表。",
+      });
+      return;
+    }
+
+    setDrillingNodeId(nodeId);
+    appendLog({
+      level: "info",
+      title: "手动下钻",
+      message: `函数：${targetNode.name}\n文件：${targetNode.filePath ?? TEXT.unknownFunctionFile}\n策略：仅下钻一层`,
+    });
+
+    try {
+      const res = await fetch("/api/analyze-repo/drill-down", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filePaths,
+          repositoryContext: {
+            owner: repoInfo.owner,
+            repo: repoInfo.repo,
+            branch: repoInfo.branch,
+            repositoryUrl: repoInfo.repositoryUrl,
+            repositoryDescription: repoInfo.description,
+          },
+          analysisResult: aiAnalysis,
+          nodePath,
+        }),
+      });
+
+      const data = (await res.json().catch(() => null)) as unknown;
+
+      if (!res.ok) {
+        const message =
+          isAnalyzeRepoDrillDownErrorResponse(data) &&
+          typeof data.error === "string"
+            ? data.error
+            : TEXT.aiConfigCheck;
+
+        appendLog({
+          level: "error",
+          title: "手动下钻失败",
+          message,
+        });
+
+        if (isAnalyzeRepoDrillDownErrorResponse(data)) {
+          appendFunctionOverviewLogs(
+            aiAnalysis.functionCallOverview,
+            data.debug?.functionOverview ?? null,
+          );
+        }
+
+        return;
+      }
+
+      if (!isAnalyzeRepoDrillDownSuccessResponse(data)) {
+        appendLog({
+          level: "error",
+          title: "手动下钻失败",
+          message: TEXT.invalidAiResponse,
+        });
+        return;
+      }
+
+      setAiAnalysis(data.result);
+      appendFunctionOverviewLogs(
+        data.result.functionCallOverview,
+        data.debug.functionOverview,
+      );
+
+      if (data.debug.functionOverview?.status === "completed") {
+        shouldPersistHistoryRef.current = true;
+        persistHistorySnapshot(data.result, workLogs);
+      }
+    } catch (error) {
+      console.error("Manual drill-down failed:", error);
+      appendLog({
+        level: "error",
+        title: "手动下钻失败",
+        message: TEXT.aiRuntimeError,
+      });
+    } finally {
+      setDrillingNodeId(null);
     }
   };
 
@@ -1590,19 +1761,31 @@ function AnalyzePageContent() {
                               <ul className="mt-2 space-y-1.5">
                                 {collectFunctionDescendants(
                                   aiAnalysis.functionCallOverview.root,
-                                ).map((child) => (
-                                  <li
-                                    key={`${child.name}-${child.filePath ?? "unknown"}`}
-                                    className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-600 dark:border-gray-800 dark:bg-gray-900/60 dark:text-gray-300"
-                                  >
-                                    <p className="font-mono text-[11px] text-gray-800 dark:text-gray-100">
-                                      {child.name}
-                                    </p>
-                                    <p className="mt-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
-                                      {child.filePath ?? TEXT.unknownFunctionFile}
-                                    </p>
-                                  </li>
-                                ))}
+                                ).map((child, index) => {
+                                  const routeLabel = getFunctionCallNodeRouteLabel(child);
+
+                                  return (
+                                    <li
+                                      key={`${child.name}-${child.filePath ?? "unknown"}-${routeLabel ?? "no-route"}-${index}`}
+                                      className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-600 dark:border-gray-800 dark:bg-gray-900/60 dark:text-gray-300"
+                                    >
+                                      <p className="font-mono text-[11px] text-gray-800 dark:text-gray-100">
+                                        {child.name}
+                                      </p>
+                                      <p className="mt-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
+                                        {child.filePath ?? TEXT.unknownFunctionFile}
+                                      </p>
+                                      {routeLabel && (
+                                        <p
+                                          className="mt-1 truncate font-mono text-[11px] text-sky-600 dark:text-sky-300"
+                                          title={routeLabel}
+                                        >
+                                          URL: {routeLabel}
+                                        </p>
+                                      )}
+                                    </li>
+                                  );
+                                })}
                               </ul>
                             )}
                           </div>
@@ -1785,6 +1968,8 @@ function AnalyzePageContent() {
                     activeModuleId={activeModuleId}
                     selectedFilePath={selectedFilePath}
                     onSelectFile={setSelectedFilePath}
+                    onDrillDownNode={handleManualDrillDown}
+                    drillingNodeId={drillingNodeId}
                     isLoading={isAnalyzingAI}
                     emptyMessage={
                       aiAnalysis

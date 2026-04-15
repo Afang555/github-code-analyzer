@@ -34,12 +34,19 @@ import {
 import {
   countFunctionTreeNodes,
   createRankedFunctionSearchPaths,
+  findFunctionDefinitionInContent,
   isLikelyNonProjectFunctionName,
   isSearchableFunctionFile,
   normalizeFunctionSearchName,
   searchFunctionDefinitionInFiles,
   type FunctionDefinitionMatch,
 } from "@/lib/ai/functionCallSearch";
+import {
+  collectFunctionCallBridgeRouteHandlers,
+  resolveFunctionCallBridge,
+  resolveFunctionCallBridgeContinuation,
+} from "@/lib/ai/functionCallBridges";
+import { formatFunctionCallRouteLabel } from "@/lib/functionCallBridgeUtils";
 
 const DEFAULT_REPOSITORY_ANALYSIS_MODEL =
   process.env.OPENAI_COMPAT_MODEL?.trim() || "gpt-5.4";
@@ -65,10 +72,11 @@ const PROJECT_INTRO_DIRECT_READ_LINE_LIMIT = 300;
 const PROJECT_INTRO_SEGMENT_LINE_COUNT = 150;
 const MAX_KEY_SUB_FUNCTIONS = 20;
 const MAX_FUNCTION_LOCATION_GUESS_PATHS = 6;
+const MAX_FUNCTION_LOCATION_CANDIDATE_CONTENT_PATHS = 4;
 const MAX_FUNCTION_MODULES = 10;
 const DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH = parsePositiveIntegerEnv(
   process.env.OPENAI_COMPAT_FUNCTION_MAX_DEPTH,
-  2,
+  3,
 );
 
 const TEXT = {
@@ -208,6 +216,23 @@ const functionLocationGuessJsonTemplate = `{
   "candidatePaths": ["src/config/loadConfig.ts"],
   "reason": "函数名与配置加载职责高度相关，文件名和目录结构都与该函数语义匹配。"
 }`;
+
+const functionLocationCandidateContentJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    found: {
+      type: "boolean",
+    },
+    filePath: {
+      type: ["string", "null"],
+    },
+    reason: {
+      type: "string",
+    },
+  },
+  required: ["found", "filePath", "reason"],
+} as const;
 
 const FUNCTION_LOCATION_GUESS_SYSTEM_MESSAGES = [
   "你是一名资深软件架构师。",
@@ -387,6 +412,10 @@ type FunctionNodeDescriptor = {
   name: string;
   filePath: string | null;
   summary: string;
+  bridgeId: string | null;
+  bridgeNodeType: string | null;
+  routePath: string | null;
+  routeMethods: string[];
 };
 
 type FunctionModuleNodeAssignment = {
@@ -411,10 +440,20 @@ type FunctionLocationGuessResult = {
 };
 
 type FunctionLocationAttempt = {
-  strategy: "same_file" | "ai_guess" | "project_search";
+  strategy:
+    | "same_file"
+    | "ai_guess"
+    | "ai_candidate_content"
+    | "project_search";
   candidatePaths: string[];
   matchedFilePath: string | null;
   matchedLine: number | null;
+  reason: string;
+};
+
+type FunctionLocationCandidateContentResult = {
+  found: boolean;
+  filePath: string | null;
   reason: string;
 };
 
@@ -423,6 +462,7 @@ type FunctionDrillDownContext = {
   analysisResult: AIAnalysisResult;
   promptFilePaths: string[];
   searchFilePaths: string[];
+  bridgeRouteHandlers: FunctionCallNode[];
   projectIntroduction: ProjectIntroductionExcerpt;
   loadFileContent: (path: string) => Promise<string>;
   maxDepth: number;
@@ -435,6 +475,14 @@ type FunctionDrillDownContext = {
 type FunctionDrillDownResult = {
   node: FunctionCallNode;
   analyzedDepth: number;
+};
+
+type ResolvedFunctionNodePath = {
+  node: FunctionCallNode;
+  depth: number;
+  parentFunctionName: string;
+  parentFilePath: string | null;
+  callPath: string[];
 };
 
 const CLEAR_STOP_DIVE_NAME_PATTERNS = [
@@ -461,6 +509,51 @@ const OOP_PRIMARY_LANGUAGE_MARKERS = [
 ] as const;
 
 const CPP_PRIMARY_LANGUAGE_MARKERS = ["c++", "cpp", "cxx", "cc"] as const;
+const GENERIC_MODULE_PATH_SEGMENTS = new Set([
+  "src",
+  "app",
+  "apps",
+  "lib",
+  "libs",
+  "pkg",
+  "packages",
+  "internal",
+  "common",
+  "shared",
+  "core",
+  "main",
+  "java",
+  "kotlin",
+  "scala",
+  "groovy",
+  "com",
+  "org",
+  "net",
+  "io",
+  "api",
+  "rest",
+  "http",
+  "https",
+  "controller",
+  "controllers",
+  "service",
+  "services",
+  "repository",
+  "repositories",
+  "dao",
+  "model",
+  "models",
+  "entity",
+  "entities",
+  "impl",
+  "impls",
+  "generated",
+  "gen",
+  "utils",
+  "util",
+  "helpers",
+  "helper",
+]);
 
 function parsePositiveIntegerEnv(
   value: string | undefined,
@@ -547,6 +640,42 @@ function cloneFunctionDrillDownResult(
     analyzedDepth: result.analyzedDepth,
     node: cloneFunctionCallNode(result.node),
   };
+}
+
+function mergeFunctionCallChildren(children: FunctionCallNode[]): FunctionCallNode[] {
+  const merged = new Map<string, FunctionCallNode>();
+
+  for (const child of children) {
+    const key = buildDrillDownVisitKey(child);
+
+    if (!merged.has(key)) {
+      merged.set(key, cloneFunctionCallNode(child));
+      continue;
+    }
+
+    const existing = merged.get(key)!;
+    merged.set(key, {
+      ...existing,
+      filePath: existing.filePath ?? child.filePath,
+      summary:
+        existing.summary.trim().length >= child.summary.trim().length
+          ? existing.summary
+          : child.summary,
+      bridgeMetadata: existing.bridgeMetadata ?? child.bridgeMetadata,
+      shouldDive:
+        existing.shouldDive === 1 || child.shouldDive === 1
+          ? 1
+          : existing.shouldDive === 0 || child.shouldDive === 0
+            ? 0
+            : -1,
+      children:
+        existing.children.length > 0
+          ? existing.children
+          : child.children.map((grandChild) => cloneFunctionCallNode(grandChild)),
+    });
+  }
+
+  return Array.from(merged.values()).slice(0, MAX_KEY_SUB_FUNCTIONS);
 }
 
 function pushDrillDownCacheEvent(args: {
@@ -822,6 +951,309 @@ function ensureFunctionModules(modules: FunctionModule[]): FunctionModule[] {
   return [createFallbackFunctionModule()];
 }
 
+function normalizeModuleToken(value: string): string {
+  return value
+    .replace(/\.[^.]+$/g, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .replace(/[^A-Za-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
+function stripCommonModuleSuffixes(value: string): string {
+  return value.replace(
+    /(controller|service|repository|handler|manager|provider|usecase|use-case|facade|client|route|mapper|processor|impl)$/i,
+    "",
+  );
+}
+
+function formatModuleDisplayName(token: string): string {
+  return token
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function deriveModuleTokenFromRoute(routePath: string | null): string | null {
+  if (!routePath) {
+    return null;
+  }
+
+  const primaryRoute = routePath.split("|")[0]?.trim() ?? "";
+  const segments = primaryRoute
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  for (const segment of segments) {
+    if (
+      segment.startsWith(":") ||
+      (segment.startsWith("{") && segment.endsWith("}")) ||
+      (segment.startsWith("[") && segment.endsWith("]")) ||
+      /^\d+$/.test(segment)
+    ) {
+      continue;
+    }
+
+    const token = normalizeModuleToken(stripCommonModuleSuffixes(segment));
+    if (token) {
+      return token;
+    }
+  }
+
+  return null;
+}
+
+function deriveModuleTokenFromFilePath(filePath: string | null): string | null {
+  if (!filePath) {
+    return null;
+  }
+
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const segments = normalizedPath.split("/").filter(Boolean);
+  const fileName = segments.pop() ?? "";
+  const fileStemToken = normalizeModuleToken(
+    stripCommonModuleSuffixes(fileName.replace(/\.[^.]+$/g, "")),
+  );
+
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const token = normalizeModuleToken(stripCommonModuleSuffixes(segments[index] ?? ""));
+    if (!token || GENERIC_MODULE_PATH_SEGMENTS.has(token)) {
+      continue;
+    }
+
+    return token;
+  }
+
+  return fileStemToken || null;
+}
+
+function createHeuristicFunctionModuleAnalysis(args: {
+  nodes: FunctionNodeDescriptor[];
+}): FunctionModuleAnalysisResult {
+  const coreModule: FunctionModule = {
+    id: "module-core",
+    name: "Core Flow",
+    summary: "Owns the entrypoint and shared orchestration nodes.",
+  };
+  const bucketByModuleId = new Map<
+    string,
+    {
+      module: FunctionModule;
+      nodeIds: string[];
+      weight: number;
+    }
+  >();
+  const preferredModuleByNodeId = new Map<string, string>();
+
+  for (const node of args.nodes) {
+    if (node.nodeId === "root") {
+      continue;
+    }
+
+    const routeToken = deriveModuleTokenFromRoute(node.routePath);
+    const fileToken = deriveModuleTokenFromFilePath(node.filePath);
+    const token = routeToken ?? fileToken;
+
+    if (!token || token === "core") {
+      preferredModuleByNodeId.set(node.nodeId, coreModule.id);
+      continue;
+    }
+
+    const moduleId = `module-${token}`;
+    const displayName = formatModuleDisplayName(token);
+    const summary = routeToken
+      ? `Handles ${displayName} related routes and controller flows.`
+      : `Contains ${displayName} related business logic.`;
+    const bucket = bucketByModuleId.get(moduleId) ?? {
+      module: {
+        id: moduleId,
+        name: displayName || "Domain Module",
+        summary,
+      },
+      nodeIds: [],
+      weight: 0,
+    };
+
+    bucket.nodeIds.push(node.nodeId);
+    bucket.weight += routeToken ? 2 : 1;
+    bucketByModuleId.set(moduleId, bucket);
+    preferredModuleByNodeId.set(node.nodeId, moduleId);
+  }
+
+  const selectedBuckets = Array.from(bucketByModuleId.values())
+    .sort((left, right) => {
+      return (
+        right.weight - left.weight ||
+        right.nodeIds.length - left.nodeIds.length ||
+        left.module.name.localeCompare(right.module.name)
+      );
+    })
+    .slice(0, Math.max(0, MAX_FUNCTION_MODULES - 1));
+  const allowedModuleIds = new Set(selectedBuckets.map((bucket) => bucket.module.id));
+  const modules = [coreModule, ...selectedBuckets.map((bucket) => bucket.module)];
+  const nodeAssignments = args.nodes.map((node) => {
+    if (node.nodeId === "root") {
+      return {
+        nodeId: node.nodeId,
+        moduleId: coreModule.id,
+      };
+    }
+
+    const preferredModuleId = preferredModuleByNodeId.get(node.nodeId);
+    return {
+      nodeId: node.nodeId,
+      moduleId:
+        preferredModuleId && allowedModuleIds.has(preferredModuleId)
+          ? preferredModuleId
+          : coreModule.id,
+    };
+  });
+
+  return {
+    modules,
+    nodeAssignments,
+  };
+}
+
+function shouldPreferHeuristicFunctionModules(args: {
+  aiAnalysis: FunctionModuleAnalysisResult;
+  heuristicAnalysis: FunctionModuleAnalysisResult;
+  totalNodes: number;
+}): boolean {
+  const aiAssignedNodeCount = new Set(
+    args.aiAnalysis.nodeAssignments.map((assignment) => assignment.nodeId),
+  ).size;
+
+  if (args.aiAnalysis.modules.length === 0 || aiAssignedNodeCount === 0) {
+    return true;
+  }
+
+  if (
+    args.totalNodes >= 6 &&
+    args.heuristicAnalysis.modules.length > 1 &&
+    args.aiAnalysis.modules.length <= 1 &&
+    aiAssignedNodeCount <= 1
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isValidFunctionNodePath(nodePath: number[]): boolean {
+  return nodePath.every(
+    (index) => Number.isInteger(index) && Number.isFinite(index) && index >= 0,
+  );
+}
+
+function resolveFunctionNodePath(
+  root: FunctionCallNode,
+  nodePath: number[],
+): ResolvedFunctionNodePath | null {
+  if (!isValidFunctionNodePath(nodePath)) {
+    return null;
+  }
+
+  let current: FunctionCallNode = root;
+  let parentFunctionName = "ROOT";
+  let parentFilePath: string | null = null;
+  const callPath: string[] = [root.name];
+
+  for (const childIndex of nodePath) {
+    const nextNode = current.children[childIndex];
+
+    if (!nextNode) {
+      return null;
+    }
+
+    parentFunctionName = current.name;
+    parentFilePath = current.filePath;
+    current = nextNode;
+    callPath.push(nextNode.name);
+  }
+
+  return {
+    node: current,
+    depth: nodePath.length,
+    parentFunctionName,
+    parentFilePath,
+    callPath,
+  };
+}
+
+function replaceFunctionNodeAtPath(
+  root: FunctionCallNode,
+  nodePath: number[],
+  nextNode: FunctionCallNode,
+): FunctionCallNode {
+  if (nodePath.length === 0) {
+    return nextNode;
+  }
+
+  const [head, ...rest] = nodePath;
+
+  return {
+    ...root,
+    children: root.children.map((child, index) =>
+      index === head ? replaceFunctionNodeAtPath(child, rest, nextNode) : child,
+    ),
+  };
+}
+
+function computeFunctionOverviewAnalyzedDepth(root: FunctionCallNode): number {
+  let maxDepth = 0;
+
+  const visit = (node: FunctionCallNode, depth: number) => {
+    maxDepth = Math.max(maxDepth, depth);
+
+    for (const child of node.children) {
+      visit(child, depth + 1);
+    }
+  };
+
+  visit(root, 0);
+  return Math.max(1, maxDepth);
+}
+
+function flattenToOneLayerChildren(
+  children: FunctionCallNode[],
+  inheritedModuleId: string | null,
+): FunctionCallNode[] {
+  return children.map((child) => ({
+    ...child,
+    moduleId: child.moduleId ?? inheritedModuleId,
+    children: [],
+  }));
+}
+
+function buildManualDrillDownPromptPaths(args: {
+  node: FunctionCallNode;
+  parentFilePath: string | null;
+  resolvedFilePath: string;
+  searchFilePaths: string[];
+  promptFilePaths: string[];
+}): string[] {
+  const rankedPaths = createRankedFunctionSearchPaths({
+    filePaths: args.searchFilePaths,
+    functionName: args.node.name,
+    parentFilePath: args.parentFilePath,
+    hintedFilePath: args.resolvedFilePath,
+  });
+
+  return Array.from(
+    new Set(
+      [
+        args.resolvedFilePath,
+        args.parentFilePath,
+        ...rankedPaths,
+        ...args.promptFilePaths,
+      ].filter((path): path is string => Boolean(path)),
+    ),
+  ).slice(0, MAX_DRILL_DOWN_PROMPT_PATHS);
+}
+
 function collectFunctionNodeDescriptors(root: FunctionCallNode): FunctionNodeDescriptor[] {
   const descriptors: FunctionNodeDescriptor[] = [];
 
@@ -831,13 +1263,22 @@ function collectFunctionNodeDescriptors(root: FunctionCallNode): FunctionNodeDes
     parentNodeId: string | null,
     depth: number,
   ) => {
+    const routeLabel = formatFunctionCallRouteLabel({
+      routePath: node.bridgeMetadata?.routePath ?? null,
+      routeMethods: node.bridgeMetadata?.routeMethods ?? [],
+    });
+
     descriptors.push({
       nodeId,
       parentNodeId,
       depth,
       name: node.name,
       filePath: node.filePath,
-      summary: node.summary,
+      summary: routeLabel ? `${node.summary} | route: ${routeLabel}` : node.summary,
+      bridgeId: node.bridgeMetadata?.bridgeId ?? null,
+      bridgeNodeType: node.bridgeMetadata?.nodeType ?? null,
+      routePath: node.bridgeMetadata?.routePath ?? null,
+      routeMethods: node.bridgeMetadata?.routeMethods ?? [],
     });
 
     for (const [index, child] of node.children.entries()) {
@@ -909,6 +1350,13 @@ function buildFunctionModuleAnalysisMessages(args: {
         node.parentNodeId ?? "null"
       } | depth: ${node.depth} | name: ${node.name} | filePath: ${
         node.filePath ?? "null"
+      } | bridgeId: ${node.bridgeId ?? "null"} | bridgeNodeType: ${
+        node.bridgeNodeType ?? "null"
+      } | route: ${
+        formatFunctionCallRouteLabel({
+          routePath: node.routePath,
+          routeMethods: node.routeMethods,
+        }) ?? "null"
       } | summary: ${node.summary}`,
   );
 
@@ -1044,6 +1492,69 @@ function normalizeFunctionLocationGuessResult(
       ),
     ).slice(0, MAX_FUNCTION_LOCATION_GUESS_PATHS),
     reason: result.reason.trim(),
+  };
+}
+
+function normalizeFunctionLocationCandidateContentResult(
+  value: unknown,
+): FunctionLocationCandidateContentResult {
+  if (!value || typeof value !== "object") {
+    throw new Error("Function candidate content location result must be a JSON object.");
+  }
+
+  const result = value as Record<string, unknown>;
+
+  if (typeof result.found !== "boolean") {
+    throw new Error("Function candidate content location result field found must be boolean.");
+  }
+
+  if (typeof result.reason !== "string" || !result.reason.trim()) {
+    throw new Error("Function candidate content location result field reason must be non-empty.");
+  }
+
+  return {
+    found: result.found,
+    filePath:
+      typeof result.filePath === "string" && result.filePath.trim()
+        ? result.filePath.trim()
+        : null,
+    reason: result.reason.trim(),
+  };
+}
+
+function buildFunctionLocationCandidateExcerpt(args: {
+  content: string;
+  functionName: string;
+}): PreparedFileExcerpt {
+  const normalizedName = normalizeFunctionSearchName(args.functionName);
+
+  if (!normalizedName) {
+    return prepareFileExcerpt(args.content, {
+      directLineLimit: 220,
+      segmentLineCount: 110,
+    });
+  }
+
+  const lines = splitLines(args.content);
+  const matcher = new RegExp(`\\b${escapeRegExp(normalizedName)}\\b`);
+  const targetLineIndex = lines.findIndex((line) => matcher.test(line));
+
+  if (targetLineIndex < 0) {
+    return prepareFileExcerpt(args.content, {
+      directLineLimit: 220,
+      segmentLineCount: 110,
+    });
+  }
+
+  const start = Math.max(0, targetLineIndex - 80);
+  const end = Math.min(lines.length, targetLineIndex + 81);
+  const excerptLines = lines.slice(start, end);
+
+  return {
+    content: excerptLines.join("\n"),
+    totalLines: lines.length,
+    analyzedLines: excerptLines.length,
+    truncated: start > 0 || end < lines.length,
   };
 }
 
@@ -1347,6 +1858,10 @@ function splitLines(content: string): string[] {
   return content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function findProjectIntroductionPath(filePaths: string[]): string | null {
   const rootReadme = filePaths.find((path) => /^readme\.(md|mdx|txt)$/i.test(path));
 
@@ -1519,6 +2034,70 @@ function createCachedFileContentLoader(
   };
 }
 
+async function expandFunctionOverviewFromRoot(args: {
+  root: FunctionCallNode;
+  initialAnalyzedDepth: number;
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  verifiedEntryPoint: string;
+  promptFilePaths: string[];
+  searchFilePaths: string[];
+  projectIntroduction: ProjectIntroductionExcerpt;
+  loadFileContent: (path: string) => Promise<string>;
+}): Promise<{
+  overview: FunctionCallOverview;
+  drillDownAttempts: FunctionDrillDownDebugAttempt[];
+  cacheEvents: FunctionDrillDownCacheEvent[];
+}> {
+  const normalizedRootNode: FunctionCallNode = {
+    ...args.root,
+    filePath: args.root.filePath ?? args.verifiedEntryPoint,
+    shouldDive: 1,
+    children: args.root.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+  };
+  const resolvedChildren: FunctionCallNode[] = [];
+  let analyzedDepth = Math.max(1, args.initialAnalyzedDepth);
+  const drillDownContext: FunctionDrillDownContext = {
+    repositoryContext: args.repositoryContext,
+    analysisResult: args.analysisResult,
+    promptFilePaths: args.promptFilePaths,
+    searchFilePaths: args.searchFilePaths,
+    bridgeRouteHandlers: collectFunctionCallBridgeRouteHandlers(args.root),
+    projectIntroduction: args.projectIntroduction,
+    loadFileContent: args.loadFileContent,
+    maxDepth: DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH,
+    inProgressNodeKeys: new Set<string>(),
+    resultCache: new Map<string, FunctionDrillDownResult>(),
+    drillDownAttempts: [],
+    cacheEvents: [],
+  };
+
+  for (const child of normalizedRootNode.children) {
+    const childResult = await drillDownFunctionNode({
+      node: child,
+      parentFunctionName: normalizedRootNode.name,
+      parentFilePath: normalizedRootNode.filePath,
+      callPath: [normalizedRootNode.name, child.name],
+      depth: 1,
+      context: drillDownContext,
+    });
+    resolvedChildren.push(childResult.node);
+    analyzedDepth = Math.max(analyzedDepth, childResult.analyzedDepth);
+  }
+
+  return {
+    overview: {
+      analyzedDepth,
+      root: {
+        ...normalizedRootNode,
+        children: resolvedChildren,
+      },
+    },
+    drillDownAttempts: drillDownContext.drillDownAttempts,
+    cacheEvents: drillDownContext.cacheEvents,
+  };
+}
+
 function buildLocationGuessPromptPaths(args: {
   filePaths: string[];
   functionName: string;
@@ -1583,6 +2162,104 @@ async function locateFunctionDefinition(args: {
     hintedFilePath: args.hintedFilePath,
   });
   const availableSearchablePaths = new Set(searchablePaths);
+  const aiLocateWithinCandidateFiles = async (
+    candidatePaths: string[],
+  ): Promise<FunctionDefinitionMatch | null> => {
+    const normalizedCandidates = Array.from(
+      new Set(
+        candidatePaths
+          .filter((path) => availableSearchablePaths.has(path))
+          .slice(0, MAX_FUNCTION_LOCATION_CANDIDATE_CONTENT_PATHS),
+      ),
+    );
+
+    if (normalizedCandidates.length === 0) {
+      return null;
+    }
+
+    const candidateContents = await Promise.all(
+      normalizedCandidates.map(async (filePath) => ({
+        filePath,
+        excerpt: buildFunctionLocationCandidateExcerpt({
+          content: await args.loadFileContent(filePath),
+          functionName: args.functionName,
+        }),
+      })),
+    );
+
+    const matched = await requestJsonCompletion<FunctionLocationCandidateContentResult>(
+      {
+        model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是代码函数定位助手。你只能在给定候选文件中选择一个最可能定义目标函数的文件。所有自然语言输出必须使用简体中文，只返回合法 JSON。",
+          },
+          {
+            role: "user",
+            content: [
+              "请根据目标函数名、父函数上下文以及候选文件内容节选，判断哪个候选文件最可能定义了目标函数。",
+              "如果没有足够证据，请返回 found=false，不要猜测候选列表之外的文件。",
+              `目标函数：${args.functionName}`,
+              `父函数：${args.parentFunctionName}`,
+              `父函数文件：${args.parentFilePath ?? "null"}`,
+              "候选文件节选：",
+              ...candidateContents.map(
+                (candidate) =>
+                  `- filePath: ${candidate.filePath}\n${candidate.excerpt.content}`,
+              ),
+            ].join("\n\n"),
+          },
+        ],
+        schemaName: "function_location_candidate_content",
+        schema: functionLocationCandidateContentJsonSchema as Record<
+          string,
+          unknown
+        >,
+        normalize: normalizeFunctionLocationCandidateContentResult,
+      },
+    );
+
+    if (!matched.result.found || !matched.result.filePath) {
+      return null;
+    }
+
+    const selectedFilePath = matched.result.filePath;
+
+    if (!normalizedCandidates.includes(selectedFilePath)) {
+      return null;
+    }
+
+    const selectedContent = await args.loadFileContent(selectedFilePath);
+    const matchedLocation = findFunctionDefinitionInContent({
+      content: selectedContent,
+      filePath: selectedFilePath,
+      functionName: args.functionName,
+      strategy: "ai_guess",
+    });
+
+    if (matchedLocation) {
+      return {
+        ...matchedLocation,
+        strategy: "ai_guess",
+      };
+    }
+
+    const excerpt = buildFunctionLocationCandidateExcerpt({
+      content: selectedContent,
+      functionName: args.functionName,
+    });
+    const lines = splitLines(selectedContent);
+    return {
+      filePath: selectedFilePath,
+      line: 1,
+      snippet: excerpt.content,
+      totalLines: lines.length,
+      extractedLines: excerpt.analyzedLines,
+      strategy: "ai_guess",
+    };
+  };
 
   if (
     args.parentFilePath &&
@@ -1679,6 +2356,47 @@ async function locateFunctionDefinition(args: {
         location: guessedMatch,
         attempts,
       };
+    }
+
+    try {
+      const candidateContentMatch = await aiLocateWithinCandidateFiles(
+        guessedPaths,
+      );
+
+      attempts.push({
+        strategy: "ai_candidate_content",
+        candidatePaths: guessedPaths.slice(
+          0,
+          MAX_FUNCTION_LOCATION_CANDIDATE_CONTENT_PATHS,
+        ),
+        matchedFilePath: candidateContentMatch?.filePath ?? null,
+        matchedLine: candidateContentMatch?.line ?? null,
+        reason: candidateContentMatch
+          ? "正则未直接命中后，基于候选文件内容节选由 AI 兜底定位成功。"
+          : "候选文件内容节选兜底未能确认目标函数定义位置。",
+      });
+
+      if (candidateContentMatch) {
+        return {
+          location: candidateContentMatch,
+          attempts,
+        };
+      }
+    } catch (error) {
+      if (error instanceof AIModelInvocationError) {
+        attempts.push({
+          strategy: "ai_candidate_content",
+          candidatePaths: guessedPaths.slice(
+            0,
+            MAX_FUNCTION_LOCATION_CANDIDATE_CONTENT_PATHS,
+          ),
+          matchedFilePath: null,
+          matchedLine: null,
+          reason: `候选文件内容节选兜底失败：${error.message}`,
+        });
+      } else {
+        throw error;
+      }
     }
   } else {
     attempts.push({
@@ -1873,6 +2591,12 @@ async function drillDownFunctionNode(args: {
       resolvedFilePath: located.location.filePath,
       context,
     });
+    const bridgeContinuationChildren = resolveFunctionCallBridgeContinuation({
+      node,
+      locatedFilePath: located.location.filePath,
+      locatedSnippet: located.location.snippet,
+      bridgeRouteHandlers: context.bridgeRouteHandlers,
+    });
 
     try {
       const drillDown = await requestJsonCompletion<FunctionCallNode>({
@@ -1905,11 +2629,20 @@ async function drillDownFunctionNode(args: {
         model: drillDown.debug,
       });
 
+      const mergedChildren = mergeFunctionCallChildren([
+        ...drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+        ...bridgeContinuationChildren,
+      ]);
       const normalizedNode: FunctionCallNode = {
         ...drillDown.result,
         name: node.name,
         filePath: located.location.filePath,
-        children: drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+        bridgeMetadata: node.bridgeMetadata ?? drillDown.result.bridgeMetadata,
+        shouldDive:
+          mergedChildren.length > 0
+            ? 1
+            : drillDown.result.shouldDive,
+        children: mergedChildren,
       };
 
       let finalResult: FunctionDrillDownResult;
@@ -2200,10 +2933,11 @@ async function analyzeFunctionOverview(args: {
     };
   }
 
+  let entryContent: string;
   let entryExcerpt: PreparedFileExcerpt;
 
   try {
-    const entryContent = await loadFileContent(verifiedEntryPoint);
+    entryContent = await loadFileContent(verifiedEntryPoint);
     entryExcerpt = prepareFileExcerpt(entryContent, {
       directLineLimit: FUNCTION_ANALYSIS_FILE_DIRECT_READ_LINE_LIMIT,
       segmentLineCount: FUNCTION_ANALYSIS_FILE_SEGMENT_LINE_COUNT,
@@ -2221,6 +2955,45 @@ async function analyzeFunctionOverview(args: {
         model: null,
         drillDownAttempts: [],
         cacheEvents: [],
+      },
+    };
+  }
+
+  const bridge = await resolveFunctionCallBridge({
+    analysisResult,
+    verifiedEntryPoint,
+    entryContent,
+    filePaths,
+    loadFileContent,
+  });
+
+  if (bridge) {
+    const expandedOverview = await expandFunctionOverviewFromRoot({
+      root: bridge.root,
+      initialAnalyzedDepth: 1,
+      repositoryContext,
+      analysisResult,
+      verifiedEntryPoint,
+      promptFilePaths,
+      searchFilePaths: filePaths,
+      projectIntroduction,
+      loadFileContent,
+    });
+
+    return {
+      result: expandedOverview.overview,
+      debug: {
+        targetEntryPoint: verifiedEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "completed",
+        message: `Framework bridge matched: ${bridge.framework}. Connected the entrypoint to ${
+          bridge.handlerCount
+        } route handlers${
+          bridge.truncated ? `, showing the first ${bridge.root.children.length}` : ""
+        }.`,
+        model: null,
+        drillDownAttempts: expandedOverview.drillDownAttempts,
+        cacheEvents: expandedOverview.cacheEvents,
       },
     };
   }
@@ -2256,64 +3029,32 @@ async function analyzeFunctionOverview(args: {
       };
     }
 
-    const rootNode = overview.result.root;
-    const normalizedRootNode: FunctionCallNode = {
-      ...rootNode,
-      filePath: verifiedEntryPoint,
-      shouldDive: 1,
-      children: rootNode.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
-    };
-    const resolvedChildren: FunctionCallNode[] = [];
-    let analyzedDepth = overview.result.analyzedDepth;
-    const drillDownContext: FunctionDrillDownContext = {
+    const expandedOverview = await expandFunctionOverviewFromRoot({
+      root: overview.result.root,
+      initialAnalyzedDepth: overview.result.analyzedDepth,
       repositoryContext,
       analysisResult,
+      verifiedEntryPoint,
       promptFilePaths,
       searchFilePaths: filePaths,
       projectIntroduction,
       loadFileContent,
-      maxDepth: DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH,
-      inProgressNodeKeys: new Set<string>(),
-      resultCache: new Map<string, FunctionDrillDownResult>(),
-      drillDownAttempts: [],
-      cacheEvents: [],
-    };
-
-    for (const child of normalizedRootNode.children) {
-      const childResult = await drillDownFunctionNode({
-        node: child,
-        parentFunctionName: normalizedRootNode.name,
-        parentFilePath: verifiedEntryPoint,
-        callPath: [normalizedRootNode.name, child.name],
-        depth: 1,
-        context: drillDownContext,
-      });
-      resolvedChildren.push(childResult.node);
-      analyzedDepth = Math.max(analyzedDepth, childResult.analyzedDepth);
-    }
-
-    const normalizedResult: FunctionCallOverview = {
-      analyzedDepth,
-      root: {
-        ...normalizedRootNode,
-        children: resolvedChildren,
-      },
-    };
+    });
 
     return {
-      result: normalizedResult,
+      result: expandedOverview.overview,
       debug: {
         targetEntryPoint: verifiedEntryPoint,
         readmePath: projectIntroduction.path,
         status: "completed",
         message: `已完成函数调用链递归分析，共识别 ${
-          normalizedResult.root
-            ? countFunctionTreeNodes(normalizedResult.root) - 1
+          expandedOverview.overview.root
+            ? countFunctionTreeNodes(expandedOverview.overview.root) - 1
             : 0
-        } 个非根节点，最大下钻层级 ${normalizedResult.analyzedDepth}，配置上限 ${DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH}。`,
+        } 个非根节点，最大下钻层级 ${expandedOverview.overview.analyzedDepth}，配置上限 ${DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH}。`,
         model: overview.debug,
-        drillDownAttempts: drillDownContext.drillDownAttempts,
-        cacheEvents: drillDownContext.cacheEvents,
+        drillDownAttempts: expandedOverview.drillDownAttempts,
+        cacheEvents: expandedOverview.cacheEvents,
       },
     };
   } catch (error) {
@@ -2359,6 +3100,9 @@ async function analyzeFunctionModules(args: {
   }
 
   const nodes = collectFunctionNodeDescriptors(overview.root);
+  const heuristicModuleAnalysis = createHeuristicFunctionModuleAnalysis({
+    nodes,
+  });
 
   try {
     const moduleAnalysis = await requestJsonCompletion<FunctionModuleAnalysisResult>(
@@ -2374,10 +3118,16 @@ async function analyzeFunctionModules(args: {
         normalize: normalizeFunctionModuleAnalysisResult,
       },
     );
-
+    const selectedModuleAnalysis = shouldPreferHeuristicFunctionModules({
+      aiAnalysis: moduleAnalysis.result,
+      heuristicAnalysis: heuristicModuleAnalysis,
+      totalNodes: nodes.length,
+    })
+      ? heuristicModuleAnalysis
+      : moduleAnalysis.result;
     const applied = applyFunctionModulesToOverview({
       overview,
-      moduleAnalysis: moduleAnalysis.result,
+      moduleAnalysis: selectedModuleAnalysis,
     });
 
     return {
@@ -2385,7 +3135,10 @@ async function analyzeFunctionModules(args: {
       modules: applied.modules,
       debug: {
         status: "completed",
-        message: `${TEXT.functionModuleSuccessPrefix}${applied.modules.length}${TEXT.functionModuleSuccessMiddle}${applied.assignedNodes}/${applied.totalNodes}${TEXT.functionModuleSuccessSuffix}`,
+        message:
+          selectedModuleAnalysis === heuristicModuleAnalysis
+            ? `Function module analysis used local heuristic grouping. Modules: ${applied.modules.length}, assigned nodes: ${applied.assignedNodes}/${applied.totalNodes}.`
+            : `${TEXT.functionModuleSuccessPrefix}${applied.modules.length}${TEXT.functionModuleSuccessMiddle}${applied.assignedNodes}/${applied.totalNodes}${TEXT.functionModuleSuccessSuffix}`,
         totalNodes: applied.totalNodes,
         assignedNodes: applied.assignedNodes,
         moduleCount: applied.modules.length,
@@ -2396,22 +3149,266 @@ async function analyzeFunctionModules(args: {
     if (error instanceof AIModelInvocationError) {
       const applied = applyFunctionModulesToOverview({
         overview,
-        moduleAnalysis: {
-          modules: [],
-          nodeAssignments: [],
-        },
+        moduleAnalysis: heuristicModuleAnalysis,
       });
 
       return {
         overview: applied.overview,
         modules: applied.modules,
         debug: {
-          status: "error",
-          message: error.message,
+          status: "completed",
+          message: `Function module analysis fell back to local heuristic grouping because the AI request failed: ${error.message}`,
           totalNodes: applied.totalNodes,
           assignedNodes: applied.assignedNodes,
           moduleCount: applied.modules.length,
           model: error.debug,
+        },
+      };
+    }
+
+    throw error;
+  }
+}
+
+export async function drillDownFunctionOverviewNode(args: {
+  filePaths: string[];
+  repositoryContext: RepositoryAnalysisContext;
+  analysisResult: AIAnalysisResult;
+  nodePath: number[];
+}): Promise<{ result: AIAnalysisResult; debug: FunctionCallAnalysisDebugData }> {
+  const { filePaths, repositoryContext, analysisResult, nodePath } = args;
+  const overview = analysisResult.functionCallOverview;
+  const promptFilePaths = filePaths.slice(0, MAX_ANALYSIS_PATHS);
+  const projectIntroduction = await loadProjectIntroductionExcerpt({
+    repositoryContext,
+    filePaths,
+  });
+  const targetEntryPoint =
+    analysisResult.verifiedEntryPoint ?? overview?.root?.filePath ?? null;
+
+  if (!overview?.root) {
+    return {
+      result: analysisResult,
+      debug: {
+        targetEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "skipped",
+        message: "当前没有可用的函数全景图，无法执行手动下钻。",
+        model: null,
+        drillDownAttempts: [],
+        cacheEvents: [],
+      },
+    };
+  }
+
+  if (!isValidFunctionNodePath(nodePath)) {
+    return {
+      result: analysisResult,
+      debug: {
+        targetEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "error",
+        message: "手动下钻目标路径无效。",
+        model: null,
+        drillDownAttempts: [],
+        cacheEvents: [],
+      },
+    };
+  }
+
+  const resolvedNode = resolveFunctionNodePath(overview.root, nodePath);
+  if (!resolvedNode) {
+    return {
+      result: analysisResult,
+      debug: {
+        targetEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "error",
+        message: "未找到手动下钻目标节点。",
+        model: null,
+        drillDownAttempts: [],
+        cacheEvents: [],
+      },
+    };
+  }
+
+  if (resolvedNode.node.children.length > 0) {
+    return {
+      result: analysisResult,
+      debug: {
+        targetEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "skipped",
+        message: "目标节点已展开子节点，无需再次手动下钻。",
+        model: null,
+        drillDownAttempts: [],
+        cacheEvents: [],
+      },
+    };
+  }
+
+  const loadFileContent = createCachedFileContentLoader(repositoryContext);
+  const nodeKey = buildDepthAwareDrillDownVisitKey(
+    resolvedNode.node,
+    resolvedNode.depth,
+  );
+  const bridgeRouteHandlers = collectFunctionCallBridgeRouteHandlers(overview.root);
+
+  const located = await locateFunctionDefinition({
+    repositoryContext,
+    analysisResult,
+    functionName: resolvedNode.node.name,
+    parentFunctionName: resolvedNode.parentFunctionName,
+    parentFilePath: resolvedNode.parentFilePath,
+    hintedFilePath: resolvedNode.node.filePath,
+    promptFilePaths,
+    searchFilePaths: filePaths,
+    loadFileContent,
+  });
+
+  if (!located.location) {
+    return {
+      result: analysisResult,
+      debug: {
+        targetEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "error",
+        message: "手动下钻失败：无法定位目标函数定义。",
+        model: null,
+        drillDownAttempts: [
+          {
+            nodeKey,
+            functionName: resolvedNode.node.name,
+            parentFunctionName: resolvedNode.parentFunctionName,
+            depth: resolvedNode.depth,
+            callPath: resolvedNode.callPath,
+            locationFilePath: null,
+            status: "error",
+            message: "函数定位失败，未执行下钻分析。",
+            model: null,
+          },
+        ],
+        cacheEvents: [],
+      },
+    };
+  }
+
+  const snippetExcerpt = prepareFileExcerpt(located.location.snippet, {
+    directLineLimit: FUNCTION_SNIPPET_DIRECT_READ_LINE_LIMIT,
+    segmentLineCount: FUNCTION_SNIPPET_SEGMENT_LINE_COUNT,
+  });
+  const drillDownPromptPaths = buildManualDrillDownPromptPaths({
+    node: resolvedNode.node,
+    parentFilePath: resolvedNode.parentFilePath,
+    resolvedFilePath: located.location.filePath,
+    searchFilePaths: filePaths,
+    promptFilePaths,
+  });
+  const bridgeContinuationChildren = resolveFunctionCallBridgeContinuation({
+    node: resolvedNode.node,
+    locatedFilePath: located.location.filePath,
+    locatedSnippet: located.location.snippet,
+    bridgeRouteHandlers,
+  });
+
+  try {
+    const drillDown = await requestJsonCompletion<FunctionCallNode>({
+      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+      messages: buildFunctionDrillDownMessages({
+        repositoryContext,
+        analysisResult,
+        targetFunction: resolvedNode.node,
+        parentFunctionName: resolvedNode.parentFunctionName,
+        callPath: resolvedNode.callPath,
+        location: located.location,
+        snippetExcerpt,
+        projectIntroduction,
+        filePaths: drillDownPromptPaths,
+      }),
+      schemaName: "function_call_drill_down",
+      schema: functionCallDrillDownJsonSchema as Record<string, unknown>,
+      normalize: normalizeFunctionCallNode,
+    });
+
+    const mergedChildren = mergeFunctionCallChildren([
+      ...drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+      ...bridgeContinuationChildren,
+    ]);
+    const nextChildren = flattenToOneLayerChildren(
+      mergedChildren,
+      resolvedNode.node.moduleId,
+    );
+    const updatedNode: FunctionCallNode = {
+      ...drillDown.result,
+      name: resolvedNode.node.name,
+      filePath: located.location.filePath,
+      moduleId: resolvedNode.node.moduleId,
+      bridgeMetadata:
+        resolvedNode.node.bridgeMetadata ?? drillDown.result.bridgeMetadata,
+      shouldDive: nextChildren.length > 0 ? 1 : drillDown.result.shouldDive,
+      children: nextChildren,
+    };
+    const nextRoot = replaceFunctionNodeAtPath(overview.root, nodePath, updatedNode);
+    const nextOverview: FunctionCallOverview = {
+      analyzedDepth: Math.max(
+        overview.analyzedDepth,
+        computeFunctionOverviewAnalyzedDepth(nextRoot),
+      ),
+      root: nextRoot,
+    };
+    const nextResult: AIAnalysisResult = {
+      ...analysisResult,
+      functionCallOverview: nextOverview,
+    };
+
+    return {
+      result: nextResult,
+      debug: {
+        targetEntryPoint,
+        readmePath: projectIntroduction.path,
+        status: "completed",
+        message: `已完成手动下钻：${resolvedNode.node.name}，新增 ${nextChildren.length} 个子节点（仅一层）。`,
+        model: drillDown.debug,
+        drillDownAttempts: [
+          {
+            nodeKey,
+            functionName: resolvedNode.node.name,
+            parentFunctionName: resolvedNode.parentFunctionName,
+            depth: resolvedNode.depth,
+            callPath: resolvedNode.callPath,
+            locationFilePath: located.location.filePath,
+            status: "completed",
+            message: "手动下钻完成，仅展开当前节点下一层子节点。",
+            model: drillDown.debug,
+          },
+        ],
+        cacheEvents: [],
+      },
+    };
+  } catch (error) {
+    if (error instanceof AIModelInvocationError) {
+      return {
+        result: analysisResult,
+        debug: {
+          targetEntryPoint,
+          readmePath: projectIntroduction.path,
+          status: "error",
+          message: error.message,
+          model: error.debug,
+          drillDownAttempts: [
+            {
+              nodeKey,
+              functionName: resolvedNode.node.name,
+              parentFunctionName: resolvedNode.parentFunctionName,
+              depth: resolvedNode.depth,
+              callPath: resolvedNode.callPath,
+              locationFilePath: located.location.filePath,
+              status: "error",
+              message: error.message,
+              model: error.debug,
+            },
+          ],
+          cacheEvents: [],
         },
       };
     }

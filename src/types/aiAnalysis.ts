@@ -14,11 +14,20 @@ export interface FunctionModule {
   summary: string;
 }
 
+export interface FunctionCallBridgeMetadata {
+  bridgeId: string;
+  framework: string | null;
+  nodeType: string;
+  routePath: string | null;
+  routeMethods: string[];
+}
+
 export interface FunctionCallNode {
   name: string;
   filePath: string | null;
   summary: string;
   moduleId: string | null;
+  bridgeMetadata: FunctionCallBridgeMetadata | null;
   shouldDive: FunctionShouldDive;
   children: FunctionCallNode[];
 }
@@ -148,6 +157,20 @@ export interface AnalyzeRepoSuccessResponse {
 export interface AnalyzeRepoErrorResponse {
   error: string;
   debug?: RepositoryAnalysisDebugData;
+}
+
+export interface AnalyzeRepoDrillDownDebugData {
+  functionOverview: FunctionCallAnalysisDebugData | null;
+}
+
+export interface AnalyzeRepoDrillDownSuccessResponse {
+  result: AIAnalysisResult;
+  debug: AnalyzeRepoDrillDownDebugData;
+}
+
+export interface AnalyzeRepoDrillDownErrorResponse {
+  error: string;
+  debug?: AnalyzeRepoDrillDownDebugData;
 }
 
 const TEXT = {
@@ -420,6 +443,43 @@ function normalizeOptionalString(value: unknown): string | null {
   return value.trim();
 }
 
+function normalizeBridgeRouteMethods(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+
+  return Array.from(new Set(normalized));
+}
+
+function normalizeFunctionCallBridgeMetadata(
+  value: unknown,
+): FunctionCallBridgeMetadata | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const bridgeId = normalizeOptionalString(record.bridgeId);
+  const nodeType = normalizeOptionalString(record.nodeType);
+
+  if (!bridgeId || !nodeType) {
+    return null;
+  }
+
+  return {
+    bridgeId,
+    framework: normalizeOptionalString(record.framework),
+    nodeType,
+    routePath: normalizeOptionalString(record.routePath),
+    routeMethods: normalizeBridgeRouteMethods(record.routeMethods),
+  };
+}
+
 export function normalizeFunctionModules(value: unknown): FunctionModule[] {
   if (!Array.isArray(value)) {
     return [];
@@ -489,6 +549,7 @@ export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
     filePath: normalizeOptionalString(node.filePath),
     summary: summary.trim(),
     moduleId: normalizeOptionalString(node.moduleId),
+    bridgeMetadata: normalizeFunctionCallBridgeMetadata(node.bridgeMetadata),
     shouldDive: node.shouldDive,
     children: node.children.map((child) => normalizeFunctionCallNode(child)),
   };
@@ -762,5 +823,36 @@ export function isAnalyzeRepoErrorResponse(
     isRecord(value) &&
     typeof value.error === "string" &&
     (value.debug === undefined || isRepositoryAnalysisDebugData(value.debug))
+  );
+}
+
+function isAnalyzeRepoDrillDownDebugData(
+  value: unknown,
+): value is AnalyzeRepoDrillDownDebugData {
+  return (
+    isRecord(value) &&
+    (value.functionOverview === null ||
+      isFunctionCallAnalysisDebugData(value.functionOverview))
+  );
+}
+
+export function isAnalyzeRepoDrillDownSuccessResponse(
+  value: unknown,
+): value is AnalyzeRepoDrillDownSuccessResponse {
+  return (
+    isRecord(value) &&
+    isAIAnalysisResult(value.result) &&
+    isAnalyzeRepoDrillDownDebugData(value.debug)
+  );
+}
+
+export function isAnalyzeRepoDrillDownErrorResponse(
+  value: unknown,
+): value is AnalyzeRepoDrillDownErrorResponse {
+  return (
+    isRecord(value) &&
+    typeof value.error === "string" &&
+    (value.debug === undefined ||
+      isAnalyzeRepoDrillDownDebugData(value.debug))
   );
 }
