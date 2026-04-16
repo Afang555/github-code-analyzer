@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { normalizeAppSettingsInput } from "@/lib/appSettings";
 import {
   AIAnalysisServiceError,
   drillDownFunctionOverviewNode,
@@ -9,13 +10,14 @@ import {
   normalizeAIAnalysisResult,
   type AIAnalysisResult,
 } from "@/types/aiAnalysis";
+import { normalizeRepositoryContext } from "@/types/repository";
 
 export const runtime = "nodejs";
 
 const TEXT = {
   invalidFilePaths: "filePaths 数组无效或为空。",
-  invalidRepositoryContext:
-    "仓库上下文无效，缺少 owner/repo/branch/repositoryUrl。",
+  invalidRepositoryContext: "repositoryContext 无效。",
+  invalidSettings: "settings 无效。",
   invalidNodePath: "nodePath 无效，必须是由非负整数组成的数组。",
   invalidAnalysisResult: "analysisResult 无效，无法解析当前分析结果。",
   drillDownFailed: "手动下钻分析失败。",
@@ -42,9 +44,6 @@ export async function POST(req: Request) {
   try {
     const body = (await req.json()) as Record<string, unknown>;
     const filePaths = body.filePaths;
-    const repositoryContext = body.repositoryContext as
-      | Record<string, unknown>
-      | undefined;
     const nodePath = body.nodePath;
 
     if (
@@ -58,15 +57,23 @@ export async function POST(req: Request) {
       );
     }
 
-    if (
-      !repositoryContext ||
-      !isNonEmptyString(repositoryContext.owner) ||
-      !isNonEmptyString(repositoryContext.repo) ||
-      !isNonEmptyString(repositoryContext.branch) ||
-      !isNonEmptyString(repositoryContext.repositoryUrl)
-    ) {
+    let repositoryContext;
+    let settings;
+
+    try {
+      repositoryContext = normalizeRepositoryContext(body.repositoryContext);
+    } catch {
       return NextResponse.json(
         { error: TEXT.invalidRepositoryContext },
+        { status: 400 },
+      );
+    }
+
+    try {
+      settings = normalizeAppSettingsInput(body.settings);
+    } catch {
+      return NextResponse.json(
+        { error: TEXT.invalidSettings },
         { status: 400 },
       );
     }
@@ -83,6 +90,7 @@ export async function POST(req: Request) {
     );
     const normalizedNodePath = nodePath as number[];
     let analysisResult: AIAnalysisResult;
+
     try {
       analysisResult = normalizeAIAnalysisResult(body.analysisResult);
     } catch {
@@ -94,18 +102,10 @@ export async function POST(req: Request) {
 
     const outcome = await drillDownFunctionOverviewNode({
       filePaths: normalizedFilePaths,
-      repositoryContext: {
-        owner: repositoryContext.owner.trim(),
-        repo: repositoryContext.repo.trim(),
-        branch: repositoryContext.branch.trim(),
-        repositoryUrl: repositoryContext.repositoryUrl.trim(),
-        repositoryDescription:
-          typeof repositoryContext.repositoryDescription === "string"
-            ? repositoryContext.repositoryDescription
-            : null,
-      },
+      repositoryContext,
       analysisResult,
       nodePath: normalizedNodePath,
+      settings,
     });
 
     return NextResponse.json({

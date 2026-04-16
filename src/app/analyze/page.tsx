@@ -8,12 +8,14 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
   AlertCircle,
   ArrowLeft,
+  FolderOpen,
   Loader2,
   Maximize2,
   Sparkles,
@@ -24,13 +26,21 @@ import { SiGithub } from "react-icons/si";
 import { CodeViewer } from "@/components/CodeViewer";
 import { FileTree } from "@/components/FileTree";
 import { FunctionOverviewPanel } from "@/components/FunctionOverviewPanel";
+import { AppSettingsDialog } from "@/components/AppSettingsDialog";
+import {
+  getAppSettingsServerSnapshot,
+  getAppSettingsSnapshot,
+  subscribeAppSettings,
+} from "@/lib/appSettingsStore";
 import {
   createAnalysisHistoryRecord,
-  createFileTreeFromFileList,
-  flattenFileTreePaths,
   getAnalysisHistoryRecordById,
   upsertAnalysisHistoryRecord,
 } from "@/lib/analysisHistory";
+import {
+  createFileTreeFromFileList,
+  flattenFileTreePaths,
+} from "@/lib/fileTree";
 import {
   buildFunctionModuleColorMap,
   getFunctionModuleColor,
@@ -42,8 +52,10 @@ import { cn } from "@/lib/utils";
 import {
   getRepositoryInfo,
   getRepositoryTree,
+  type RepositoryContext,
+  type RepositoryDescriptor,
   type FileNode,
-} from "@/services/githubService";
+} from "@/services/repositoryService";
 import {
   isAnalyzeRepoDrillDownErrorResponse,
   isAnalyzeRepoDrillDownSuccessResponse,
@@ -59,6 +71,9 @@ import {
   type FunctionModule,
   type FunctionModuleAnalysisDebugData,
 } from "@/types/aiAnalysis";
+import {
+  buildRepositoryLocationLabel,
+} from "@/types/repository";
 import { parseGitHubUrl } from "@/utils/github";
 import { ANALYZE_TEXT as TEXT } from "./uiText";
 
@@ -636,21 +651,20 @@ function PanelToggleButton({
 
 function AnalyzePageContent() {
   const searchParams = useSearchParams();
-  const autoAnalyzedRepoRef = useRef<string | null>(null);
+  const autoAnalyzedSourceRef = useRef<string | null>(null);
   const autoLoadedHistoryRef = useRef<string | null>(null);
   const shouldPersistHistoryRef = useRef(false);
   const logCounterRef = useRef(0);
   const resizeStateRef = useRef<ResizeState | null>(null);
   const workspacePanelsRef = useRef<HTMLDivElement | null>(null);
+  const appSettings = useSyncExternalStore(
+    subscribeAppSettings,
+    getAppSettingsSnapshot,
+    getAppSettingsServerSnapshot,
+  );
 
   const [urlInput, setUrlInput] = useState("");
-  const [repoInfo, setRepoInfo] = useState<{
-    owner: string;
-    repo: string;
-    branch: string;
-    repositoryUrl: string;
-    description: string | null;
-  } | null>(null);
+  const [repoInfo, setRepoInfo] = useState<RepositoryContext | null>(null);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [selectedFilePath, setSelectedFilePath] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -943,14 +957,30 @@ function AnalyzePageContent() {
     setIsAnalyzingAI(false);
     setError(null);
     setAiError(null);
-    setUrlInput(history.repositoryUrl);
-    setRepoInfo({
-      owner: history.owner,
-      repo: history.repo,
-      branch: history.branch,
-      repositoryUrl: history.repositoryUrl,
-      description: history.description,
-    });
+    setUrlInput(
+      history.sourceType === "github" ? history.repositoryUrl : history.localPath,
+    );
+    setRepoInfo(
+      history.sourceType === "github"
+        ? {
+            sourceType: "github",
+            projectName: history.projectName,
+            owner: history.owner,
+            repo: history.repo,
+            branch: history.branch,
+            repositoryUrl: history.repositoryUrl,
+            repositoryDescription: history.description,
+          }
+        : {
+            sourceType: "local",
+            projectName: history.projectName,
+            sourceId: history.sourceId,
+            branch: null,
+            localPath: history.localPath,
+            repositoryUrl: history.repositoryUrl,
+            repositoryDescription: history.description,
+          },
+    );
     setFileTree(restoredFileTree);
     setSelectedFilePath(preferredFilePath);
     setAiAnalysis(history.analysisResult);
@@ -958,11 +988,191 @@ function AnalyzePageContent() {
     setDrillingNodeId(null);
     setWorkLogs(history.workLogs);
 
-    autoAnalyzedRepoRef.current = `${history.owner}/${history.repo}`;
+    autoAnalyzedSourceRef.current =
+      history.sourceType === "github"
+        ? `github:${history.owner}/${history.repo}`
+        : `local:${history.sourceId}`;
     return true;
   });
 
-  const analyzeRepository = async (urlToAnalyze: string) => {
+  const resetAnalysisState = () => {
+    setIsLoading(true);
+    setError(null);
+    setAiError(null);
+    setDrillingNodeId(null);
+    setFileTree([]);
+    setSelectedFilePath("");
+    setRepoInfo(null);
+    setAiAnalysis(null);
+    setActiveModuleId(null);
+  };
+
+  const loadRepositoryAndAnalyze = async (
+    descriptor: RepositoryDescriptor,
+  ) => {
+    resetAnalysisState();
+
+    const context = await getRepositoryInfo(descriptor, appSettings);
+    setRepoInfo(context);
+    setUrlInput(
+      context.sourceType === "github" ? context.repositoryUrl : context.localPath,
+    );
+
+    if (context.sourceType === "github") {
+      appendLog({
+        level: "success",
+        title: TEXT.githubValidationPassed,
+        message: `${TEXT.defaultBranchPrefix}${context.branch}${TEXT.fullStop}`,
+      });
+    } else {
+      appendLog({
+        level: "success",
+        title: "本地目录已载入",
+        message: `${context.localPath}\n已创建本地项目快照，开始读取目录结构。`,
+      });
+    }
+
+    const tree = await getRepositoryTree(context, appSettings);
+    setFileTree(tree);
+
+    const totalFileCount = countFilesInTree(tree);
+    appendLog({
+      level: "info",
+      title: TEXT.fileListLoaded,
+      message: `${TEXT.loadedPrefix}${totalFileCount}${TEXT.loadedSuffix}`,
+    });
+
+    const nextUrl =
+      context.sourceType === "github"
+        ? `/analyze?repo=${context.owner}/${context.repo}`
+        : `/analyze?source=local&id=${context.sourceId}`;
+    window.history.pushState(
+      { ...window.history.state, as: nextUrl, url: nextUrl },
+      "",
+      nextUrl,
+    );
+
+    const filePaths = collectAnalysisCandidatePaths(tree);
+    const filteredOutCount = Math.max(totalFileCount - filePaths.length, 0);
+
+    appendLog({
+      level: "info",
+      title: TEXT.fileFilterDone,
+      message: `${TEXT.retainedPrefix}${filePaths.length}${TEXT.retainedMiddle}${filteredOutCount}${TEXT.retainedSuffix}`,
+      jsonSections: [
+        {
+          label: TEXT.filteredFileList,
+          payload: {
+            count: filePaths.length,
+            files: filePaths,
+          },
+        },
+      ],
+    });
+
+    if (filePaths.length === 0) {
+      setAiError(TEXT.noFilesForAi);
+      appendLog({
+        level: "warning",
+        title: TEXT.aiSkipped,
+        message: TEXT.noSuitableFiles,
+      });
+      return;
+    }
+
+    setIsAnalyzingAI(true);
+    setAiError(null);
+
+    appendLog({
+      level: "info",
+      title: TEXT.aiAnalysisStarted,
+      message: `${TEXT.aiSubmittedPrefix}${filePaths.length}${TEXT.aiSubmittedSuffix}`,
+    });
+
+    try {
+      const res = await fetch("/api/analyze-repo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filePaths,
+          repositoryContext: context,
+          settings: appSettings,
+        }),
+      });
+
+      const data = (await res.json().catch(() => null)) as unknown;
+
+      if (!res.ok) {
+        const errorMessage =
+          isAnalyzeRepoErrorResponse(data) && typeof data.error === "string"
+            ? data.error
+            : TEXT.aiConfigCheck;
+
+        setAiError(errorMessage);
+        appendLog({
+          level: "error",
+          title: TEXT.aiFailed,
+          message: errorMessage,
+          requestPayload: isAnalyzeRepoErrorResponse(data)
+            ? buildModelRequestPayload(data.debug?.repositoryAnalysis)
+            : undefined,
+          responsePayload: isAnalyzeRepoErrorResponse(data)
+            ? buildModelResponsePayload(data.debug?.repositoryAnalysis)
+            : undefined,
+        });
+        return;
+      }
+
+      if (!isAnalyzeRepoSuccessResponse(data)) {
+        setAiError(TEXT.invalidAiResponse);
+        appendLog({
+          level: "error",
+          title: TEXT.aiFailed,
+          message: TEXT.invalidAiResponse,
+        });
+        return;
+      }
+
+      setAiAnalysis(data.result);
+      setSelectedFilePath(
+        data.result.verifiedEntryPoint ?? data.result.entryPoints[0] ?? "",
+      );
+      appendLog({
+        level: "success",
+        title: TEXT.aiCompleted,
+        message: summarizeAnalysisResult(data.result),
+        requestPayload: buildModelRequestPayload(data.debug.repositoryAnalysis),
+        responsePayload: buildModelResponsePayload(
+          data.debug.repositoryAnalysis,
+          data.result,
+        ),
+      });
+      appendEntryVerificationLogs(
+        data.debug.entryVerification,
+        data.result.entryPoints.length,
+      );
+      appendFunctionOverviewLogs(
+        data.result.functionCallOverview,
+        data.debug.functionOverview,
+      );
+      appendFunctionModuleLogs(
+        data.result.functionModules,
+        data.debug.moduleAnalysis,
+      );
+    } catch (aiRequestError) {
+      console.error("AI Analysis failed:", aiRequestError);
+      setAiError(TEXT.aiRetryLater);
+      appendLog({
+        level: "error",
+        title: TEXT.aiFailed,
+        message: TEXT.aiRuntimeError,
+      });
+    } finally {
+      setIsAnalyzingAI(false);
+    }
+  };
+
+  const analyzeGitHubRepository = async (urlToAnalyze: string) => {
     const normalizedUrl = urlToAnalyze.trim();
     shouldPersistHistoryRef.current = true;
     autoLoadedHistoryRef.current = null;
@@ -979,16 +1189,6 @@ function AnalyzePageContent() {
       return;
     }
 
-    setIsLoading(true);
-    setError(null);
-    setAiError(null);
-    setDrillingNodeId(null);
-    setFileTree([]);
-    setSelectedFilePath("");
-    setRepoInfo(null);
-    setAiAnalysis(null);
-    setActiveModuleId(null);
-
     appendLog({
       level: "info",
       title: TEXT.parseSuccess,
@@ -996,176 +1196,13 @@ function AnalyzePageContent() {
     });
 
     try {
-      const info = await getRepositoryInfo(parsed.owner, parsed.repo);
-      const defaultBranch = info.default_branch;
-
-      setRepoInfo({
-        owner: parsed.owner,
-        repo: parsed.repo,
-        branch: defaultBranch,
-        repositoryUrl:
-          typeof info.html_url === "string" && info.html_url.trim()
-            ? info.html_url
-            : normalizedUrl,
-        description:
-          typeof info.description === "string" && info.description.trim()
-            ? info.description
-            : null,
-      });
-
-      appendLog({
-        level: "success",
-        title: TEXT.githubValidationPassed,
-        message: `${TEXT.defaultBranchPrefix}${defaultBranch}${TEXT.fullStop}`,
-      });
-
-      const tree = await getRepositoryTree(
-        parsed.owner,
-        parsed.repo,
-        defaultBranch,
+      await loadRepositoryAndAnalyze(
+        {
+          sourceType: "github",
+          owner: parsed.owner,
+          repo: parsed.repo,
+        },
       );
-      setFileTree(tree);
-
-      const totalFileCount = countFilesInTree(tree);
-      appendLog({
-        level: "info",
-        title: TEXT.fileListLoaded,
-        message: `${TEXT.loadedPrefix}${totalFileCount}${TEXT.loadedSuffix}`,
-      });
-
-      const newUrl = `/analyze?repo=${parsed.owner}/${parsed.repo}`;
-      window.history.pushState(
-        { ...window.history.state, as: newUrl, url: newUrl },
-        "",
-        newUrl,
-      );
-
-      const filePaths = collectAnalysisCandidatePaths(tree);
-      const filteredOutCount = Math.max(totalFileCount - filePaths.length, 0);
-
-      appendLog({
-        level: "info",
-        title: TEXT.fileFilterDone,
-        message: `${TEXT.retainedPrefix}${filePaths.length}${TEXT.retainedMiddle}${filteredOutCount}${TEXT.retainedSuffix}`,
-        jsonSections: [
-          {
-            label: TEXT.filteredFileList,
-            payload: {
-              count: filePaths.length,
-              files: filePaths,
-            },
-          },
-        ],
-      });
-
-      if (filePaths.length > 0) {
-        setIsAnalyzingAI(true);
-        setAiError(null);
-
-        appendLog({
-          level: "info",
-          title: TEXT.aiAnalysisStarted,
-          message: `${TEXT.aiSubmittedPrefix}${filePaths.length}${TEXT.aiSubmittedSuffix}`,
-        });
-
-        try {
-          const res = await fetch("/api/analyze-repo", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              filePaths,
-              repositoryContext: {
-                owner: parsed.owner,
-                repo: parsed.repo,
-                branch: defaultBranch,
-                repositoryUrl:
-                  typeof info.html_url === "string" && info.html_url.trim()
-                    ? info.html_url
-                    : normalizedUrl,
-                repositoryDescription:
-                  typeof info.description === "string"
-                    ? info.description
-                    : null,
-              },
-            }),
-          });
-
-          const data = (await res.json().catch(() => null)) as unknown;
-
-          if (!res.ok) {
-            const errorMessage =
-              isAnalyzeRepoErrorResponse(data) && typeof data.error === "string"
-                ? data.error
-                : TEXT.aiConfigCheck;
-
-            setAiError(errorMessage);
-            appendLog({
-              level: "error",
-              title: TEXT.aiFailed,
-              message: errorMessage,
-              requestPayload: isAnalyzeRepoErrorResponse(data)
-                ? buildModelRequestPayload(data.debug?.repositoryAnalysis)
-                : undefined,
-              responsePayload: isAnalyzeRepoErrorResponse(data)
-                ? buildModelResponsePayload(data.debug?.repositoryAnalysis)
-                : undefined,
-            });
-          } else if (isAnalyzeRepoSuccessResponse(data)) {
-            setAiAnalysis(data.result);
-            setSelectedFilePath(
-              data.result.verifiedEntryPoint ?? data.result.entryPoints[0] ?? "",
-            );
-            appendLog({
-              level: "success",
-              title: TEXT.aiCompleted,
-              message: summarizeAnalysisResult(data.result),
-              requestPayload: buildModelRequestPayload(
-                data.debug.repositoryAnalysis,
-              ),
-              responsePayload: buildModelResponsePayload(
-                data.debug.repositoryAnalysis,
-                data.result,
-              ),
-            });
-            appendEntryVerificationLogs(
-              data.debug.entryVerification,
-              data.result.entryPoints.length,
-            );
-            appendFunctionOverviewLogs(
-              data.result.functionCallOverview,
-              data.debug.functionOverview,
-            );
-            appendFunctionModuleLogs(
-              data.result.functionModules,
-              data.debug.moduleAnalysis,
-            );
-          } else {
-            setAiError(TEXT.invalidAiResponse);
-            appendLog({
-              level: "error",
-              title: TEXT.aiFailed,
-              message: TEXT.invalidAiResponse,
-            });
-          }
-        } catch (aiRequestError) {
-          console.error("AI Analysis failed:", aiRequestError);
-          setAiError(TEXT.aiRetryLater);
-          appendLog({
-            level: "error",
-            title: TEXT.aiFailed,
-            message: TEXT.aiRuntimeError,
-          });
-        } finally {
-          setIsAnalyzingAI(false);
-        }
-      } else {
-        setAiError(TEXT.noFilesForAi);
-        appendLog({
-          level: "warning",
-          title: TEXT.aiSkipped,
-          message: TEXT.noSuitableFiles,
-        });
-      }
     } catch (requestError) {
       const message =
         requestError instanceof Error ? requestError.message : TEXT.unknownError;
@@ -1181,9 +1218,40 @@ function AnalyzePageContent() {
     }
   };
 
-  const handleAutoAnalyze = useEffectEvent((normalizedUrl: string) => {
+  const analyzeLocalRepository = async (sourceId: string) => {
+    shouldPersistHistoryRef.current = true;
+    autoLoadedHistoryRef.current = null;
+    startLogSession("本地项目");
+
+    try {
+      await loadRepositoryAndAnalyze(
+        {
+          sourceType: "local",
+          sourceId,
+        },
+      );
+    } catch (requestError) {
+      const message =
+        requestError instanceof Error ? requestError.message : TEXT.unknownError;
+
+      setError(message);
+      appendLog({
+        level: "error",
+        title: TEXT.repoLoadFailed,
+        message,
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleAutoAnalyzeGithub = useEffectEvent((normalizedUrl: string) => {
     setUrlInput(normalizedUrl);
-    void analyzeRepository(normalizedUrl);
+    void analyzeGitHubRepository(normalizedUrl);
+  });
+
+  const handleAutoAnalyzeLocal = useEffectEvent((sourceId: string) => {
+    void analyzeLocalRepository(sourceId);
   });
 
   useEffect(() => {
@@ -1198,19 +1266,42 @@ function AnalyzePageContent() {
       }
     }
 
-    const repoParam = searchParams.get("repo");
+    const sourceParam = searchParams.get("source")?.trim();
+    if (sourceParam === "local") {
+      const sourceId = searchParams.get("id")?.trim();
 
-    if (!repoParam || autoAnalyzedRepoRef.current === repoParam) {
+      if (!sourceId) {
+        return;
+      }
+
+      const sourceKey = `local:${sourceId}`;
+      if (autoAnalyzedSourceRef.current === sourceKey) {
+        return;
+      }
+
+      autoAnalyzedSourceRef.current = sourceKey;
+      handleAutoAnalyzeLocal(sourceId);
       return;
     }
 
-    autoAnalyzedRepoRef.current = repoParam;
+    const repoParam = searchParams.get("repo");
+
+    if (!repoParam) {
+      return;
+    }
+
+    const sourceKey = `github:${repoParam}`;
+    if (autoAnalyzedSourceRef.current === sourceKey) {
+      return;
+    }
+
+    autoAnalyzedSourceRef.current = sourceKey;
 
     const normalizedUrl = repoParam.startsWith("http")
       ? repoParam
       : `https://github.com/${repoParam}`;
 
-    handleAutoAnalyze(normalizedUrl);
+    handleAutoAnalyzeGithub(normalizedUrl);
   }, [searchParams]);
 
   const persistHistorySnapshot = useCallback(
@@ -1228,13 +1319,25 @@ function AnalyzePageContent() {
       }
 
       const historyRecord = createAnalysisHistoryRecord({
-        repoInfo: {
-          owner: repoInfo.owner,
-          repo: repoInfo.repo,
-          branch: repoInfo.branch,
-          repositoryUrl: repoInfo.repositoryUrl,
-          description: repoInfo.description,
-        },
+        repoInfo:
+          repoInfo.sourceType === "github"
+            ? {
+                sourceType: "github",
+                projectName: repoInfo.projectName,
+                owner: repoInfo.owner,
+                repo: repoInfo.repo,
+                branch: repoInfo.branch,
+                repositoryUrl: repoInfo.repositoryUrl,
+                description: repoInfo.repositoryDescription ?? null,
+              }
+            : {
+                sourceType: "local",
+                projectName: repoInfo.projectName,
+                sourceId: repoInfo.sourceId,
+                localPath: repoInfo.localPath,
+                repositoryUrl: repoInfo.repositoryUrl,
+                description: repoInfo.repositoryDescription ?? null,
+              },
         fileList,
         analysisResult: analysisResultToPersist,
         workLogs: logsToPersist,
@@ -1279,7 +1382,7 @@ function AnalyzePageContent() {
 
     if (normalizedUrl) {
       setUrlInput(normalizedUrl);
-      void analyzeRepository(normalizedUrl);
+      void analyzeGitHubRepository(normalizedUrl);
     }
   };
 
@@ -1335,15 +1438,10 @@ function AnalyzePageContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           filePaths,
-          repositoryContext: {
-            owner: repoInfo.owner,
-            repo: repoInfo.repo,
-            branch: repoInfo.branch,
-            repositoryUrl: repoInfo.repositoryUrl,
-            repositoryDescription: repoInfo.description,
-          },
+          repositoryContext: repoInfo,
           analysisResult: aiAnalysis,
           nodePath,
+          settings: appSettings,
         }),
       });
 
@@ -1544,7 +1642,11 @@ function AnalyzePageContent() {
               <ArrowLeft className="h-4 w-4" />
             </Link>
             <div className="flex items-center gap-2 font-semibold">
-              <SiGithub className="h-5 w-5" />
+              {repoInfo?.sourceType === "local" ? (
+                <FolderOpen className="h-5 w-5" />
+              ) : (
+                <SiGithub className="h-5 w-5" />
+              )}
               <span>{TEXT.brand}</span>
             </div>
           </div>
@@ -1557,38 +1659,60 @@ function AnalyzePageContent() {
                 onOpenFullscreen={() => setIsLogFullscreenOpen(true)}
               />
 
-              <div>
-                <label
-                  htmlFor="repo-url"
-                  className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400"
-                >
-                  {TEXT.repoUrl}
-                </label>
-                <input
-                  id="repo-url"
-                  type="text"
-                  value={urlInput}
-                  onChange={(e) => setUrlInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder="https://github.com/owner/repo"
-                  className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none dark:border-gray-700 dark:bg-gray-950"
-                />
-              </div>
+              {repoInfo?.sourceType === "local" ? (
+                <div className="rounded-xl border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-950">
+                  <p className="text-xs font-medium text-gray-500 dark:text-gray-400">
+                    项目来源
+                  </p>
+                  <p className="mt-2 text-sm font-semibold text-gray-900 dark:text-gray-100">
+                    {repoInfo.projectName}
+                  </p>
+                  <p
+                    className="mt-1 truncate font-mono text-xs text-gray-500 dark:text-gray-400"
+                    title={repoInfo.localPath}
+                  >
+                    {repoInfo.localPath}
+                  </p>
+                  <p className="mt-2 text-[11px] leading-relaxed text-gray-500 dark:text-gray-400">
+                    本地目录请返回首页重新选择；当前页面支持浏览文件、查看源码和继续下钻分析。
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <label
+                      htmlFor="repo-url"
+                      className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400"
+                    >
+                      {TEXT.repoUrl}
+                    </label>
+                    <input
+                      id="repo-url"
+                      type="text"
+                      value={urlInput}
+                      onChange={(e) => setUrlInput(e.target.value)}
+                      onKeyDown={handleKeyDown}
+                      placeholder="https://github.com/owner/repo"
+                      className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none dark:border-gray-700 dark:bg-gray-950"
+                    />
+                  </div>
 
-              <button
-                onClick={handleAnalyzeClick}
-                disabled={isLoading || !urlInput.trim()}
-                className="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-blue-600 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {isLoading ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    <span>{TEXT.analyzing}</span>
-                  </>
-                ) : (
-                  TEXT.startAnalyze
-                )}
-              </button>
+                  <button
+                    onClick={handleAnalyzeClick}
+                    disabled={isLoading || !urlInput.trim()}
+                    className="flex h-10 w-full items-center justify-center gap-2 rounded-md bg-blue-600 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isLoading ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <span>{TEXT.analyzing}</span>
+                      </>
+                    ) : (
+                      TEXT.startAnalyze
+                    )}
+                  </button>
+                </>
+              )}
 
               {error && (
                 <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-600 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
@@ -1843,18 +1967,29 @@ function AnalyzePageContent() {
           {repoInfo && (
             <div className="mt-auto border-t border-gray-200 px-4 py-2 dark:border-gray-800">
               <div className="mb-1 text-xs text-gray-500 dark:text-gray-400">
-                {TEXT.currentRepo}
+                {repoInfo.sourceType === "github" ? TEXT.currentRepo : "当前项目"}
               </div>
               <div
                 className="truncate text-sm font-medium"
-                title={`${repoInfo.owner}/${repoInfo.repo}`}
+                title={buildRepositoryLocationLabel(repoInfo)}
               >
-                {repoInfo.owner}/{repoInfo.repo}
+                {buildRepositoryLocationLabel(repoInfo)}
               </div>
               <div className="mt-1 flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400">
                 <span className="h-2 w-2 rounded-full bg-green-500"></span>
-                {TEXT.branchPrefix}
-                {repoInfo.branch}
+                {repoInfo.sourceType === "github" ? (
+                  <>
+                    {TEXT.branchPrefix}
+                    {repoInfo.branch}
+                  </>
+                ) : (
+                  <>
+                    路径：
+                    <span className="truncate" title={repoInfo.localPath}>
+                      {repoInfo.localPath}
+                    </span>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -1868,25 +2003,28 @@ function AnalyzePageContent() {
 
           <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
             <div className="flex items-center justify-end border-b border-gray-200 bg-white/90 px-4 py-2 backdrop-blur dark:border-gray-800 dark:bg-gray-950/90">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="mr-1 text-xs font-medium text-gray-500 dark:text-gray-400">
-                  {TEXT.panelDisplay}
-                </span>
-                <PanelToggleButton
-                  active={isFilesVisible}
-                  label={TEXT.panelFiles}
-                  onClick={() => togglePanelVisibility("files")}
-                />
-                <PanelToggleButton
-                  active={isSourceVisible}
-                  label={TEXT.panelSource}
-                  onClick={() => togglePanelVisibility("source")}
-                />
-                <PanelToggleButton
-                  active={isOverviewVisible}
-                  label={TEXT.panelOverview}
-                  onClick={() => togglePanelVisibility("overview")}
-                />
+              <div className="flex w-full flex-wrap items-center justify-between gap-2">
+                <AppSettingsDialog />
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="mr-1 text-xs font-medium text-gray-500 dark:text-gray-400">
+                    {TEXT.panelDisplay}
+                  </span>
+                  <PanelToggleButton
+                    active={isFilesVisible}
+                    label={TEXT.panelFiles}
+                    onClick={() => togglePanelVisibility("files")}
+                  />
+                  <PanelToggleButton
+                    active={isSourceVisible}
+                    label={TEXT.panelSource}
+                    onClick={() => togglePanelVisibility("source")}
+                  />
+                  <PanelToggleButton
+                    active={isOverviewVisible}
+                    label={TEXT.panelOverview}
+                    onClick={() => togglePanelVisibility("overview")}
+                  />
+                </div>
               </div>
             </div>
 
@@ -1923,7 +2061,9 @@ function AnalyzePageContent() {
                       />
                     ) : (
                       <div className="flex h-full items-center justify-center p-4 text-center text-sm text-gray-400">
-                        {TEXT.enterValidUrl}
+                        {repoInfo?.sourceType === "local"
+                          ? "未读取到本地项目文件。"
+                          : TEXT.enterValidUrl}
                       </div>
                     )}
                   </div>
@@ -1942,14 +2082,13 @@ function AnalyzePageContent() {
                 <div className="min-w-0 flex-1 overflow-hidden bg-[#1e1e1e]">
                   {repoInfo ? (
                     <CodeViewer
-                      owner={repoInfo.owner}
-                      repo={repoInfo.repo}
-                      branch={repoInfo.branch}
+                      appSettings={appSettings}
+                      repositoryContext={repoInfo}
                       path={selectedFilePath}
                     />
                   ) : (
                     <div className="flex h-full flex-col items-center justify-center bg-gray-50 text-gray-500 dark:bg-[#1e1e1e]">
-                      <SiGithub className="mb-4 h-16 w-16 text-gray-300 dark:text-gray-700" />
+                      <FolderOpen className="mb-4 h-16 w-16 text-gray-300 dark:text-gray-700" />
                       <p className="text-lg font-medium text-gray-600 dark:text-gray-400">
                         {TEXT.noRepoSelected}
                       </p>

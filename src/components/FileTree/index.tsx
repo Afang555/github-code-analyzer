@@ -2,8 +2,8 @@
 
 import { useState } from 'react';
 import { ChevronRight, ChevronDown, File, Folder } from 'lucide-react';
-import { FileNode } from '@/services/githubService';
 import { cn } from '@/lib/utils';
+import type { FileNode } from '@/types/repository';
 
 interface FileTreeProps {
   nodes: FileNode[];

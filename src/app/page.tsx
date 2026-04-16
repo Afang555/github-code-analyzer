@@ -1,46 +1,228 @@
 "use client";
 
-import { useState, useSyncExternalStore } from "react";
+import { useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
-import { Search, Code2 } from "lucide-react";
+import { Code2, FolderOpen, Loader2, Search } from "lucide-react";
 import { SiGithub } from "react-icons/si";
 
+import { AppSettingsDialog } from "@/components/AppSettingsDialog";
 import {
   getAnalysisHistoryServerSnapshot,
   getAnalysisHistorySnapshot,
   subscribeAnalysisHistory,
   type AnalysisHistoryRecord,
 } from "@/lib/analysisHistory";
+import { createLocalRepositorySnapshot } from "@/services/repositoryService";
 import { parseGitHubUrl } from "@/utils/github";
 
+type HomeMode = "github" | "local";
+
+type LocalUploadFile = {
+  path: string;
+  file: File;
+};
+
+type LocalDirectoryHandle = {
+  name: string;
+  entries(): AsyncIterable<[string, LocalFileSystemHandle]>;
+};
+
+type LocalFileHandle = {
+  kind: "file";
+  name: string;
+  getFile(): Promise<File>;
+};
+
+type LocalSubdirectoryHandle = {
+  kind: "directory";
+  name: string;
+  entries(): AsyncIterable<[string, LocalFileSystemHandle]>;
+};
+
+type LocalFileSystemHandle = LocalFileHandle | LocalSubdirectoryHandle;
+
+type DirectoryPickerWindow = Window &
+  typeof globalThis & {
+    showDirectoryPicker?: () => Promise<LocalDirectoryHandle>;
+  };
+
+const LOCAL_IGNORED_DIRECTORIES = new Set([
+  ".git",
+  ".idea",
+  ".next",
+  ".turbo",
+  ".vscode",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "vendor",
+]);
+
+const LOCAL_DIRECTORY_INPUT_PROPS = {
+  webkitdirectory: "",
+  directory: "",
+} as Record<string, string>;
+
 const TEXT = {
-  emptyUrl: "\u8bf7\u8f93\u5165 GitHub \u4ed3\u5e93\u5730\u5740",
+  emptyUrl: "请输入 GitHub 仓库地址",
   invalidUrl:
-    "GitHub \u5730\u5740\u683c\u5f0f\u4e0d\u6b63\u786e\uff0c\u4f8b\u5982\uff1ahttps://github.com/owner/repo",
-  title: "GitHub \u4ee3\u7801\u5206\u6790\u5668",
+    "GitHub 地址格式不正确，例如：https://github.com/owner/repo",
+  emptyLocalProject: "未检测到可上传的本地项目文件，请重新选择目录。",
+  title: "代码分析器",
   subtitle:
-    "\u8f93\u5165\u516c\u5f00 GitHub \u4ed3\u5e93\u5730\u5740\uff0c\u5feb\u901f\u67e5\u770b\u76ee\u5f55\u7ed3\u6784\u3001\u6e90\u7801\u5185\u5bb9\u4e0e AI \u5206\u6790\u7ed3\u679c\u3002",
-  analyze: "\u5f00\u59cb\u5206\u6790",
-  feature1Title: "\u7ed3\u6784\u53ef\u89c6\u5316",
+    "支持 GitHub 仓库和本地项目两种模式，统一查看项目结构、源码内容与 AI 分析结果。",
+  githubTab: "GitHub 项目",
+  localTab: "本地项目",
+  analyze: "开始分析",
+  localAnalyze: "选择本地目录",
+  localPreparing: "正在准备本地项目…",
+  localHint:
+    "会自动跳过 .git、node_modules、.next、dist 等常见生成目录，并将目录快照上传到本地服务端分析。",
+  localLastSelectionPrefix: "最近一次选择：",
+  localFallbackHint:
+    "如果浏览器不支持目录选择器，将自动回退为目录文件上传模式。",
+  feature1Title: "结构可视化",
   feature1Desc:
-    "\u65e0\u9700\u514b\u9686\u4ed3\u5e93\uff0c\u76f4\u63a5\u67e5\u770b\u5b8c\u6574\u7684\u9879\u76ee\u6587\u4ef6\u6811\u3002",
-  feature2Title: "\u8bed\u6cd5\u9ad8\u4eae",
+    "统一展示项目文件树，支持在 GitHub 和本地项目之间切换分析来源。",
+  feature2Title: "语法高亮",
   feature2Desc:
-    "\u4f7f\u7528\u7b2c\u4e09\u65b9\u9ad8\u4eae\u7ec4\u4ef6\uff0c\u6309\u8bed\u8a00\u53cb\u597d\u5c55\u793a\u6e90\u7801\u5185\u5bb9\u3002",
-  feature3Title: "AI \u8f85\u52a9\u5206\u6790",
+    "源代码内容按语言高亮展示，便于快速定位入口文件和关键实现。",
+  feature3Title: "AI 辅助分析",
   feature3Desc:
-    "\u81ea\u52a8\u8bc6\u522b\u4e3b\u8981\u8bed\u8a00\u3001\u6280\u672f\u6808\u6807\u7b7e\u548c\u53ef\u80fd\u7684\u9879\u76ee\u5165\u53e3\u6587\u4ef6\u3002",
-  historyTitle: "\u5386\u53f2\u5206\u6790\u8bb0\u5f55",
+    "自动识别主要语言、技术栈标签、入口文件与关键函数调用链。",
+  historyTitle: "历史分析记录",
   historyEmpty:
-    "\u8fd8\u6ca1\u6709\u5386\u53f2\u8bb0\u5f55\u3002\u5b8c\u6210\u4e00\u6b21\u5206\u6790\u540e\uff0c\u8fd9\u91cc\u4f1a\u5c55\u793a\u5df2\u4fdd\u5b58\u7684\u5de5\u7a0b\u6587\u4ef6\u3002",
-  historyLanguagePrefix: "\u8bed\u8a00\uff1a",
-  historyUnknownLanguage: "\u672a\u8bc6\u522b",
-  historyUpdatedPrefix: "\u66f4\u65b0\u65f6\u95f4\uff1a",
+    "还没有历史记录。完成一次 GitHub 或本地项目分析后，这里会展示已保存的结果。",
+  historyLanguagePrefix: "语言：",
+  historyUnknownLanguage: "未识别",
+  historySourceGithub: "GitHub",
+  historySourceLocal: "本地",
+  historyLocationPrefix: "位置：",
+  historyUpdatedPrefix: "更新时间：",
 } as const;
 
+function normalizeLocalRelativePath(path: string): string | null {
+  const normalized = path.trim().replace(/\\/g, "/");
+
+  if (!normalized) {
+    return null;
+  }
+
+  const segments = normalized.split("/").filter(Boolean);
+
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => segment === "." || segment === "..")
+  ) {
+    return null;
+  }
+
+  return segments.join("/");
+}
+
+function shouldIgnoreLocalPath(path: string): boolean {
+  return path
+    .split("/")
+    .some((segment) => LOCAL_IGNORED_DIRECTORIES.has(segment.toLowerCase()));
+}
+
+async function collectFilesFromDirectoryHandle(
+  handle: LocalDirectoryHandle,
+  prefix = "",
+): Promise<LocalUploadFile[]> {
+  const files: LocalUploadFile[] = [];
+
+  for await (const [name, entry] of handle.entries()) {
+    const nextPath = prefix ? `${prefix}/${name}` : name;
+
+    if (shouldIgnoreLocalPath(nextPath)) {
+      continue;
+    }
+
+    if (entry.kind === "directory") {
+      files.push(...(await collectFilesFromDirectoryHandle(entry, nextPath)));
+      continue;
+    }
+
+    files.push({
+      path: nextPath,
+      file: await entry.getFile(),
+    });
+  }
+
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function createLocalUploadEntriesFromFileList(
+  fileList: FileList | null,
+): {
+  projectName: string;
+  localPath: string;
+  files: LocalUploadFile[];
+} | null {
+  if (!fileList || fileList.length === 0) {
+    return null;
+  }
+
+  const files = Array.from(fileList)
+    .map((file) => {
+      const relativePath = normalizeLocalRelativePath(file.webkitRelativePath);
+
+      if (!relativePath || shouldIgnoreLocalPath(relativePath)) {
+        return null;
+      }
+
+      const firstSlashIndex = relativePath.indexOf("/");
+      const projectName =
+        firstSlashIndex >= 0
+          ? relativePath.slice(0, firstSlashIndex)
+          : relativePath;
+      const projectRelativePath =
+        firstSlashIndex >= 0
+          ? relativePath.slice(firstSlashIndex + 1)
+          : file.name;
+
+      if (!projectRelativePath) {
+        return null;
+      }
+
+      return {
+        projectName,
+        path: projectRelativePath,
+        file,
+      };
+    })
+    .filter((item): item is { projectName: string; path: string; file: File } => {
+      return item !== null;
+    });
+
+  if (files.length === 0) {
+    return null;
+  }
+
+  const projectName = files[0]?.projectName ?? "local-project";
+
+  return {
+    projectName,
+    localPath: projectName,
+    files: files.map((item) => ({
+      path: item.path,
+      file: item.file,
+    })),
+  };
+}
+
 export default function Home() {
+  const [mode, setMode] = useState<HomeMode>("github");
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [isPreparingLocal, setIsPreparingLocal] = useState(false);
+  const [lastLocalSelection, setLastLocalSelection] = useState("");
+  const localFileInputRef = useRef<HTMLInputElement | null>(null);
   const historyRecords = useSyncExternalStore<AnalysisHistoryRecord[]>(
     subscribeAnalysisHistory,
     getAnalysisHistorySnapshot,
@@ -61,11 +243,101 @@ export default function Home() {
 
   const handleOpenHistory = (record: AnalysisHistoryRecord) => {
     const params = new URLSearchParams({
-      repo: `${record.owner}/${record.repo}`,
       history: record.id,
     });
 
+    if (record.sourceType === "github") {
+      params.set("repo", `${record.owner}/${record.repo}`);
+    } else {
+      params.set("source", "local");
+      params.set("id", record.sourceId);
+    }
+
     router.push(`/analyze?${params.toString()}`);
+  };
+
+  const getHistorySourceLabel = (record: AnalysisHistoryRecord) => {
+    return record.sourceType === "github"
+      ? TEXT.historySourceGithub
+      : TEXT.historySourceLocal;
+  };
+
+  const getHistoryLocationLabel = (record: AnalysisHistoryRecord) => {
+    return record.sourceType === "github"
+      ? `${record.owner}/${record.repo}`
+      : record.localPath;
+  };
+
+  const uploadLocalSelection = async (selection: {
+    projectName: string;
+    localPath: string;
+    files: LocalUploadFile[];
+  }) => {
+    setIsPreparingLocal(true);
+    setLocalError("");
+    setLastLocalSelection(selection.localPath);
+
+    try {
+      const result = await createLocalRepositorySnapshot(selection);
+      router.push(`/analyze?source=local&id=${result.sourceId}`);
+    } catch (uploadError) {
+      setLocalError(
+        uploadError instanceof Error
+          ? uploadError.message
+          : TEXT.emptyLocalProject,
+      );
+    } finally {
+      setIsPreparingLocal(false);
+    }
+  };
+
+  const handlePickLocalDirectory = async () => {
+    const pickerWindow = window as DirectoryPickerWindow;
+    setLocalError("");
+
+    if (typeof pickerWindow.showDirectoryPicker === "function") {
+      try {
+        const handle = await pickerWindow.showDirectoryPicker();
+        const files = await collectFilesFromDirectoryHandle(handle);
+
+        if (files.length === 0) {
+          setLocalError(TEXT.emptyLocalProject);
+          return;
+        }
+
+        await uploadLocalSelection({
+          projectName: handle.name,
+          localPath: handle.name,
+          files,
+        });
+      } catch (pickError) {
+        if (pickError instanceof DOMException && pickError.name === "AbortError") {
+          return;
+        }
+
+        setLocalError(
+          pickError instanceof Error ? pickError.message : TEXT.emptyLocalProject,
+        );
+      }
+
+      return;
+    }
+
+    localFileInputRef.current?.click();
+  };
+
+  const handleLocalFileChange = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const selection = createLocalUploadEntriesFromFileList(event.currentTarget.files);
+    event.currentTarget.value = "";
+
+    if (!selection) {
+      setLocalError(TEXT.emptyLocalProject);
+      return;
+    }
+
+    await uploadLocalSelection(selection);
   };
 
   const handleAnalyze = (e: React.FormEvent) => {
@@ -91,12 +363,19 @@ export default function Home() {
   return (
     <div className="relative flex min-h-screen flex-col items-center justify-center overflow-hidden bg-gray-50 p-4 dark:bg-gray-950">
       <div className="absolute top-1/2 left-1/2 -z-10 h-[800px] w-[800px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-blue-500/5 blur-3xl dark:bg-blue-500/10" />
+      <div className="absolute top-4 right-4 z-10">
+        <AppSettingsDialog />
+      </div>
 
       <main className="w-full max-w-2xl space-y-12 text-center">
         <div className="space-y-6">
           <div className="flex justify-center">
             <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-800 dark:bg-gray-900">
-              <SiGithub className="h-16 w-16 text-gray-900 dark:text-white" />
+              {mode === "github" ? (
+                <SiGithub className="h-16 w-16 text-gray-900 dark:text-white" />
+              ) : (
+                <FolderOpen className="h-16 w-16 text-gray-900 dark:text-white" />
+              )}
             </div>
           </div>
 
@@ -111,34 +390,114 @@ export default function Home() {
         </div>
 
         <div className="rounded-2xl border border-gray-200 bg-white p-8 shadow-lg dark:border-gray-800 dark:bg-gray-900">
-          <form onSubmit={handleAnalyze} className="space-y-4">
-            <div className="relative">
-              <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-4">
-                <Search className="h-5 w-5 text-gray-400" />
-              </div>
-              <input
-                type="text"
-                value={url}
-                onChange={(e) => {
-                  setUrl(e.target.value);
-                  setError("");
-                }}
-                className="block w-full rounded-xl border border-gray-300 bg-gray-50 py-4 pr-4 pl-11 text-lg text-gray-900 transition-shadow focus:border-blue-500 focus:ring-2 focus:ring-blue-500 dark:border-gray-700 dark:bg-gray-950 dark:text-white"
-                placeholder="https://github.com/facebook/react"
-                autoFocus
-              />
-            </div>
-
-            {error && <p className="px-2 text-left text-sm text-red-500">{error}</p>}
-
+          <div className="mb-6 inline-flex rounded-full border border-gray-200 bg-gray-100 p-1 dark:border-gray-800 dark:bg-gray-950">
             <button
-              type="submit"
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-transparent bg-blue-600 px-8 py-4 text-lg font-medium text-white transition-colors hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:outline-none"
+              type="button"
+              onClick={() => setMode("github")}
+              className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+                mode === "github"
+                  ? "bg-white text-gray-900 shadow-sm dark:bg-gray-900 dark:text-white"
+                  : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+              }`}
             >
-              <Code2 className="h-5 w-5" />
-              {TEXT.analyze}
+              {TEXT.githubTab}
             </button>
-          </form>
+            <button
+              type="button"
+              onClick={() => setMode("local")}
+              className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+                mode === "local"
+                  ? "bg-white text-gray-900 shadow-sm dark:bg-gray-900 dark:text-white"
+                  : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+              }`}
+            >
+              {TEXT.localTab}
+            </button>
+          </div>
+
+          {mode === "github" ? (
+            <>
+              <form onSubmit={handleAnalyze} className="space-y-4">
+                <div className="relative">
+                  <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-4">
+                    <Search className="h-5 w-5 text-gray-400" />
+                  </div>
+                  <input
+                    type="text"
+                    value={url}
+                    onChange={(e) => {
+                      setUrl(e.target.value);
+                      setError("");
+                    }}
+                    className="block w-full rounded-xl border border-gray-300 bg-gray-50 py-4 pr-4 pl-11 text-lg text-gray-900 transition-shadow focus:border-blue-500 focus:ring-2 focus:ring-blue-500 dark:border-gray-700 dark:bg-gray-950 dark:text-white"
+                    placeholder="https://github.com/facebook/react"
+                    autoFocus
+                  />
+                </div>
+
+                {error && <p className="px-2 text-left text-sm text-red-500">{error}</p>}
+
+                <button
+                  type="submit"
+                  className="flex w-full items-center justify-center gap-2 rounded-xl border border-transparent bg-blue-600 px-8 py-4 text-lg font-medium text-white transition-colors hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:outline-none"
+                >
+                  <Code2 className="h-5 w-5" />
+                  {TEXT.analyze}
+                </button>
+              </form>
+            </>
+          ) : (
+            <div className="space-y-4 text-left">
+              <input
+                ref={localFileInputRef}
+                type="file"
+                multiple
+                onChange={handleLocalFileChange}
+                className="hidden"
+                {...LOCAL_DIRECTORY_INPUT_PROPS}
+              />
+
+              <button
+                type="button"
+                onClick={handlePickLocalDirectory}
+                disabled={isPreparingLocal}
+                className="flex w-full items-center justify-center gap-2 rounded-xl border border-transparent bg-blue-600 px-8 py-4 text-lg font-medium text-white transition-colors hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isPreparingLocal ? (
+                  <>
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                    {TEXT.localPreparing}
+                  </>
+                ) : (
+                  <>
+                    <FolderOpen className="h-5 w-5" />
+                    {TEXT.localAnalyze}
+                  </>
+                )}
+              </button>
+
+              <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm leading-relaxed text-gray-600 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-300">
+                {TEXT.localHint}
+              </div>
+
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                {TEXT.localFallbackHint}
+              </p>
+
+              {lastLocalSelection && (
+                <p className="truncate font-mono text-xs text-gray-500 dark:text-gray-400">
+                  {TEXT.localLastSelectionPrefix}
+                  {lastLocalSelection}
+                </p>
+              )}
+
+              {localError && (
+                <p className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
+                  {localError}
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="mt-6 border-t border-gray-200 pt-6 text-left dark:border-gray-800">
             <div className="mb-3 flex items-center justify-between">
@@ -163,15 +522,25 @@ export default function Home() {
                     onClick={() => handleOpenHistory(record)}
                     className="w-full rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left transition-colors hover:border-blue-300 hover:bg-blue-50/70 dark:border-gray-700 dark:bg-gray-950 dark:hover:border-blue-700 dark:hover:bg-blue-950/30"
                   >
-                    <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
-                      {record.projectName}
-                    </p>
+                    <div className="flex items-start justify-between gap-3">
+                      <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">
+                        {record.projectName}
+                      </p>
+                      <span className="rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[11px] text-gray-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300">
+                        {getHistorySourceLabel(record)}
+                      </span>
+                    </div>
 
                     <p
                       className="mt-1 truncate font-mono text-xs text-gray-600 dark:text-gray-300"
                       title={record.repositoryUrl}
                     >
                       {record.repositoryUrl}
+                    </p>
+
+                    <p className="mt-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
+                      {TEXT.historyLocationPrefix}
+                      {getHistoryLocationLabel(record)}
                     </p>
 
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">

@@ -1,6 +1,17 @@
 import "server-only";
 
-import { getFileContent } from "@/lib/githubApi";
+import { Agent } from "undici";
+
+import {
+  DEFAULT_APP_SETTINGS,
+  getGitHubTokenOverride,
+  type AppSettingsInput,
+} from "@/lib/appSettings";
+import {
+  createRepositoryDataSource,
+  type RepositoryDataSourceOptions,
+} from "@/lib/repositoryDataSource";
+import { resolveServerAppSettings } from "@/lib/serverAppSettings";
 import {
   aiAnalysisJsonSchema,
   aiAnalysisJsonTemplate,
@@ -43,22 +54,12 @@ import {
 } from "@/lib/ai/functionCallSearch";
 import {
   collectFunctionCallBridgeRouteHandlers,
+  resolveFrontendWrapperEntryPoint,
   resolveFunctionCallBridge,
   resolveFunctionCallBridgeContinuation,
 } from "@/lib/ai/functionCallBridges";
 import { formatFunctionCallRouteLabel } from "@/lib/functionCallBridgeUtils";
 
-const DEFAULT_REPOSITORY_ANALYSIS_MODEL =
-  process.env.OPENAI_COMPAT_MODEL?.trim() || "gpt-5.4";
-const DEFAULT_ENTRY_POINT_REVIEW_MODEL =
-  process.env.OPENAI_COMPAT_ENTRY_MODEL?.trim() ||
-  DEFAULT_REPOSITORY_ANALYSIS_MODEL;
-const DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL =
-  process.env.OPENAI_COMPAT_FUNCTION_MODEL?.trim() ||
-  DEFAULT_REPOSITORY_ANALYSIS_MODEL;
-const DEFAULT_FUNCTION_MODULE_ANALYSIS_MODEL =
-  process.env.OPENAI_COMPAT_MODULE_MODEL?.trim() ||
-  DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL;
 const MAX_ANALYSIS_PATHS = 1000;
 const MAX_LOCATION_GUESS_PROMPT_PATHS = 260;
 const MAX_DRILL_DOWN_PROMPT_PATHS = 260;
@@ -70,14 +71,35 @@ const FUNCTION_SNIPPET_DIRECT_READ_LINE_LIMIT = 300;
 const FUNCTION_SNIPPET_SEGMENT_LINE_COUNT = 150;
 const PROJECT_INTRO_DIRECT_READ_LINE_LIMIT = 300;
 const PROJECT_INTRO_SEGMENT_LINE_COUNT = 150;
-const MAX_KEY_SUB_FUNCTIONS = 20;
+const MAX_KEY_SUB_FUNCTIONS = DEFAULT_APP_SETTINGS.maxKeySubFunctions;
 const MAX_FUNCTION_LOCATION_GUESS_PATHS = 6;
 const MAX_FUNCTION_LOCATION_CANDIDATE_CONTENT_PATHS = 4;
 const MAX_FUNCTION_MODULES = 10;
-const DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH = parsePositiveIntegerEnv(
-  process.env.OPENAI_COMPAT_FUNCTION_MAX_DEPTH,
-  3,
+const DEFAULT_OPENAI_COMPAT_CONNECT_TIMEOUT_MS = parsePositiveIntegerEnv(
+  process.env.OPENAI_COMPAT_CONNECT_TIMEOUT_MS,
+  30_000,
 );
+const DEFAULT_OPENAI_COMPAT_REQUEST_TIMEOUT_MS = parsePositiveIntegerEnv(
+  process.env.OPENAI_COMPAT_REQUEST_TIMEOUT_MS,
+  120_000,
+);
+const DEFAULT_OPENAI_COMPAT_HEADERS_TIMEOUT_MS = parsePositiveIntegerEnv(
+  process.env.OPENAI_COMPAT_HEADERS_TIMEOUT_MS,
+  DEFAULT_OPENAI_COMPAT_REQUEST_TIMEOUT_MS,
+);
+const DEFAULT_OPENAI_COMPAT_BODY_TIMEOUT_MS = parsePositiveIntegerEnv(
+  process.env.OPENAI_COMPAT_BODY_TIMEOUT_MS,
+  DEFAULT_OPENAI_COMPAT_REQUEST_TIMEOUT_MS,
+);
+const DEFAULT_OPENAI_COMPAT_RETRY_COUNT = parseNonNegativeIntegerEnv(
+  process.env.OPENAI_COMPAT_RETRY_COUNT,
+  2,
+);
+const DEFAULT_OPENAI_COMPAT_RETRY_BACKOFF_MS = parsePositiveIntegerEnv(
+  process.env.OPENAI_COMPAT_RETRY_BACKOFF_MS,
+  1_500,
+);
+const openAICompatibleDispatcherCache = new Map<string, Agent>();
 
 const TEXT = {
   configMissing:
@@ -375,6 +397,24 @@ type JsonCompletionOptions<T> = {
   schemaName: string;
   schema: Record<string, unknown>;
   normalize: (value: unknown) => T;
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
+};
+
+type OpenAICompatibleRuntimeSettings = {
+  apiKey: string;
+  baseUrl: string;
+  repositoryAnalysisModel: string;
+  entryPointReviewModel: string;
+  functionCallAnalysisModel: string;
+  functionModuleAnalysisModel: string;
+  maxDrillDownDepth: number;
+  maxKeySubFunctions: number;
+  connectTimeoutMs: number;
+  requestTimeoutMs: number;
+  headersTimeoutMs: number;
+  bodyTimeoutMs: number;
+  retryCount: number;
+  retryBackoffMs: number;
 };
 
 type PreparedFileExcerpt = {
@@ -460,6 +500,7 @@ type FunctionLocationCandidateContentResult = {
 type FunctionDrillDownContext = {
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
   promptFilePaths: string[];
   searchFilePaths: string[];
   bridgeRouteHandlers: FunctionCallNode[];
@@ -572,6 +613,23 @@ function parsePositiveIntegerEnv(
   return parsed;
 }
 
+function parseNonNegativeIntegerEnv(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
 function isClearlyStopDiveNode(node: FunctionCallNode): boolean {
   if (!node.filePath) {
     return true;
@@ -627,10 +685,31 @@ function buildDepthAwareDrillDownVisitKey(
 }
 
 function cloneFunctionCallNode(node: FunctionCallNode): FunctionCallNode {
-  return {
+  return cloneFunctionCallNodeWithSeen(node, new WeakMap<object, FunctionCallNode>());
+}
+
+function cloneFunctionCallNodeWithSeen(
+  node: FunctionCallNode,
+  seen: WeakMap<object, FunctionCallNode>,
+): FunctionCallNode {
+  const cached = seen.get(node);
+
+  if (cached) {
+    return {
+      ...cached,
+      children: [],
+    };
+  }
+
+  const clone: FunctionCallNode = {
     ...node,
-    children: node.children.map((child) => cloneFunctionCallNode(child)),
+    children: [],
   };
+  seen.set(node, clone);
+  clone.children = node.children.map((child) =>
+    cloneFunctionCallNodeWithSeen(child, seen),
+  );
+  return clone;
 }
 
 function cloneFunctionDrillDownResult(
@@ -642,7 +721,10 @@ function cloneFunctionDrillDownResult(
   };
 }
 
-function mergeFunctionCallChildren(children: FunctionCallNode[]): FunctionCallNode[] {
+function mergeFunctionCallChildren(
+  children: FunctionCallNode[],
+  limit: number = MAX_KEY_SUB_FUNCTIONS,
+): FunctionCallNode[] {
   const merged = new Map<string, FunctionCallNode>();
 
   for (const child of children) {
@@ -675,7 +757,7 @@ function mergeFunctionCallChildren(children: FunctionCallNode[]): FunctionCallNo
     });
   }
 
-  return Array.from(merged.values()).slice(0, MAX_KEY_SUB_FUNCTIONS);
+  return Array.from(merged.values()).slice(0, limit);
 }
 
 function pushDrillDownCacheEvent(args: {
@@ -747,17 +829,54 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function getOpenAICompatibleConfig() {
-  const baseUrl = process.env.OPENAI_COMPAT_BASE_URL?.trim();
-  const apiKey = process.env.OPENAI_COMPAT_API_KEY?.trim();
+function createRepositoryDataSourceOptions(
+  settings?: AppSettingsInput,
+): RepositoryDataSourceOptions {
+  const githubToken = getGitHubTokenOverride(settings);
+
+  return githubToken
+    ? {
+        githubToken,
+      }
+    : {};
+}
+
+function getOpenAICompatibleRuntimeSettings(
+  settings?: AppSettingsInput,
+): OpenAICompatibleRuntimeSettings {
+  const resolvedSettings = resolveServerAppSettings(settings);
+  const baseUrl = resolvedSettings.aiBaseUrl;
+  const apiKey = resolvedSettings.aiApiKey;
 
   if (!baseUrl || !apiKey) {
     throw new Error(TEXT.configMissing);
   }
 
+  const repositoryAnalysisModel = resolvedSettings.aiModel;
+  const functionCallAnalysisModel =
+    process.env.OPENAI_COMPAT_FUNCTION_MODEL?.trim() ||
+    repositoryAnalysisModel;
+  const entryPointReviewModel =
+    process.env.OPENAI_COMPAT_ENTRY_MODEL?.trim() || repositoryAnalysisModel;
+  const functionModuleAnalysisModel =
+    process.env.OPENAI_COMPAT_MODULE_MODEL?.trim() ||
+    functionCallAnalysisModel;
+
   return {
     apiKey,
     baseUrl,
+    repositoryAnalysisModel,
+    entryPointReviewModel,
+    functionCallAnalysisModel,
+    functionModuleAnalysisModel,
+    maxDrillDownDepth: resolvedSettings.maxDrillDownDepth,
+    maxKeySubFunctions: resolvedSettings.maxKeySubFunctions,
+    connectTimeoutMs: DEFAULT_OPENAI_COMPAT_CONNECT_TIMEOUT_MS,
+    requestTimeoutMs: DEFAULT_OPENAI_COMPAT_REQUEST_TIMEOUT_MS,
+    headersTimeoutMs: DEFAULT_OPENAI_COMPAT_HEADERS_TIMEOUT_MS,
+    bodyTimeoutMs: DEFAULT_OPENAI_COMPAT_BODY_TIMEOUT_MS,
+    retryCount: DEFAULT_OPENAI_COMPAT_RETRY_COUNT,
+    retryBackoffMs: DEFAULT_OPENAI_COMPAT_RETRY_BACKOFF_MS,
   };
 }
 
@@ -1774,72 +1893,269 @@ function unwrapJsonPayload(rawContent: string): string {
   return candidate;
 }
 
+function getOpenAICompatibleDispatcher(
+  endpoint: string,
+  runtimeSettings: OpenAICompatibleRuntimeSettings,
+): Agent {
+  const origin = new URL(endpoint).origin;
+  const cacheKey = [
+    origin,
+    runtimeSettings.connectTimeoutMs,
+    runtimeSettings.headersTimeoutMs,
+    runtimeSettings.bodyTimeoutMs,
+  ].join("::");
+  const cached = openAICompatibleDispatcherCache.get(cacheKey);
+
+  if (cached) {
+    return cached;
+  }
+
+  const dispatcher = new Agent({
+    connectTimeout: runtimeSettings.connectTimeoutMs,
+    headersTimeout: runtimeSettings.headersTimeoutMs,
+    bodyTimeout: runtimeSettings.bodyTimeoutMs,
+  });
+
+  openAICompatibleDispatcherCache.set(cacheKey, dispatcher);
+  return dispatcher;
+}
+
+function serializeRequestError(error: unknown): unknown {
+  if (!(error instanceof Error)) {
+    return {
+      name: "UnknownError",
+      message: String(error),
+    };
+  }
+
+  const serialized: Record<string, unknown> = {
+    name: error.name,
+    message: error.message,
+  };
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+
+  if (cause instanceof Error) {
+    serialized.cause = {
+      name: cause.name,
+      message: cause.message,
+      code:
+        typeof (cause as Error & { code?: unknown }).code === "string"
+          ? (cause as Error & { code?: string }).code
+          : undefined,
+    };
+  } else if (cause !== undefined) {
+    serialized.cause = cause;
+  }
+
+  return serialized;
+}
+
+function getRequestErrorDetail(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const details = [error.message.trim()].filter(Boolean);
+  const cause = (error as Error & { cause?: unknown }).cause;
+
+  if (cause instanceof Error) {
+    const causeCode =
+      typeof (cause as Error & { code?: unknown }).code === "string"
+        ? (cause as Error & { code?: string }).code
+        : null;
+    const causeMessage = cause.message.trim();
+
+    if (causeCode && causeMessage) {
+      details.push(`${causeCode}: ${causeMessage}`);
+    } else if (causeMessage) {
+      details.push(causeMessage);
+    }
+  }
+
+  return details.join(" | ");
+}
+
+function buildNetworkErrorMessage(
+  error: unknown,
+  didTimeout: boolean,
+  runtimeSettings: OpenAICompatibleRuntimeSettings,
+): string {
+  if (didTimeout) {
+    return `AI 服务请求超时，请稍后重试或调大 OPENAI_COMPAT_REQUEST_TIMEOUT_MS（当前 ${runtimeSettings.requestTimeoutMs}ms）。`;
+  }
+
+  return `AI 服务网络请求失败，请检查模型服务地址或稍后重试。详情：${getRequestErrorDetail(
+    error,
+  )}`;
+}
+
+function shouldRetryChatCompletion(result: CompletionAttemptResult): boolean {
+  if (result.ok) {
+    return false;
+  }
+
+  return (
+    result.status === 0 ||
+    result.status === 408 ||
+    result.status === 409 ||
+    result.status === 425 ||
+    result.status === 429 ||
+    result.status >= 500
+  );
+}
+
+function getRetryDelayMs(
+  attemptIndex: number,
+  runtimeSettings: OpenAICompatibleRuntimeSettings,
+): number {
+  const multiplier = Math.max(0, attemptIndex - 1);
+  return Math.min(
+    runtimeSettings.retryBackoffMs * 2 ** multiplier,
+    8_000,
+  );
+}
+
+async function waitForRetry(delayMs: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
 async function requestChatCompletion(
   endpoint: string,
   apiKey: string,
   payload: Record<string, unknown>,
   mode: AttemptMode,
+  runtimeSettings: OpenAICompatibleRuntimeSettings,
 ): Promise<CompletionAttemptResult> {
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-    cache: "no-store",
-  });
+  const dispatcher = getOpenAICompatibleDispatcher(endpoint, runtimeSettings);
+  const controller = new AbortController();
+  let didTimeout = false;
+  const timeoutId = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, runtimeSettings.requestTimeoutMs);
 
-  const rawBody = await response.text();
-  const responsePayload = parseResponsePayload(rawBody);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+      signal: controller.signal,
+      dispatcher,
+    } as RequestInit & { dispatcher: Agent });
 
-  if (!response.ok) {
+    const rawBody = await response.text();
+    const responsePayload = parseResponsePayload(rawBody);
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        mode,
+        requestPayload: payload,
+        responsePayload,
+        status: response.status,
+        errorMessage:
+          extractErrorMessage(rawBody) ||
+          `${TEXT.requestFailedPrefix}${response.status}${TEXT.fullStop}`,
+        rawBody,
+      };
+    }
+
+    if (!isRecord(responsePayload)) {
+      return {
+        ok: false,
+        mode,
+        requestPayload: payload,
+        responsePayload,
+        status: response.status,
+        errorMessage: TEXT.invalidResponseJson,
+        rawBody,
+      };
+    }
+
+    const content = extractMessageContent(responsePayload);
+    if (!content) {
+      return {
+        ok: false,
+        mode,
+        requestPayload: payload,
+        responsePayload,
+        status: response.status,
+        errorMessage: TEXT.emptyContent,
+        rawBody,
+      };
+    }
+
     return {
-      ok: false,
+      ok: true,
       mode,
       requestPayload: payload,
       responsePayload,
       status: response.status,
-      errorMessage:
-        extractErrorMessage(rawBody) ||
-        `${TEXT.requestFailedPrefix}${response.status}${TEXT.fullStop}`,
-      rawBody,
+      content,
     };
-  }
-
-  if (!isRecord(responsePayload)) {
+  } catch (error) {
     return {
       ok: false,
       mode,
       requestPayload: payload,
-      responsePayload,
-      status: response.status,
-      errorMessage: TEXT.invalidResponseJson,
-      rawBody,
+      responsePayload: serializeRequestError(error),
+      status: 0,
+      errorMessage: buildNetworkErrorMessage(
+        error,
+        didTimeout,
+        runtimeSettings,
+      ),
+      rawBody: didTimeout
+        ? `request_timeout:${runtimeSettings.requestTimeoutMs}`
+        : getRequestErrorDetail(error),
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
+}
 
-  const content = extractMessageContent(responsePayload);
-  if (!content) {
-    return {
-      ok: false,
+async function requestChatCompletionWithRetries(
+  endpoint: string,
+  apiKey: string,
+  payload: Record<string, unknown>,
+  mode: AttemptMode,
+  runtimeSettings: OpenAICompatibleRuntimeSettings,
+): Promise<CompletionAttemptResult[]> {
+  const attempts: CompletionAttemptResult[] = [];
+
+  for (
+    let attemptIndex = 0;
+    attemptIndex <= runtimeSettings.retryCount;
+    attemptIndex += 1
+  ) {
+    const result = await requestChatCompletion(
+      endpoint,
+      apiKey,
+      payload,
       mode,
-      requestPayload: payload,
-      responsePayload,
-      status: response.status,
-      errorMessage: TEXT.emptyContent,
-      rawBody,
-    };
+      runtimeSettings,
+    );
+    attempts.push(result);
+
+    if (
+      result.ok ||
+      !shouldRetryChatCompletion(result) ||
+      attemptIndex >= runtimeSettings.retryCount
+    ) {
+      return attempts;
+    }
+
+    await waitForRetry(getRetryDelayMs(attemptIndex + 1, runtimeSettings));
   }
 
-  return {
-    ok: true,
-    mode,
-    requestPayload: payload,
-    responsePayload,
-    status: response.status,
-    content,
-  };
+  return attempts;
 }
 
 function createAttemptDebug(
@@ -1929,8 +2245,9 @@ async function requestJsonCompletion<T>({
   schemaName,
   schema,
   normalize,
+  runtimeSettings,
 }: JsonCompletionOptions<T>): Promise<{ result: T; debug: AIModelDebugData }> {
-  const { apiKey, baseUrl } = getOpenAICompatibleConfig();
+  const { apiKey, baseUrl } = runtimeSettings;
   const endpoint = resolveChatCompletionsUrl(baseUrl);
   const attempts: AIModelDebugAttempt[] = [];
   const basePayload: Record<string, unknown> = {
@@ -1939,7 +2256,7 @@ async function requestJsonCompletion<T>({
     messages,
   };
 
-  let result = await requestChatCompletion(
+  const jsonSchemaAttempts = await requestChatCompletionWithRetries(
     endpoint,
     apiKey,
     {
@@ -1954,8 +2271,10 @@ async function requestJsonCompletion<T>({
       },
     },
     "json_schema",
+    runtimeSettings,
   );
-  attempts.push(createAttemptDebug(result));
+  attempts.push(...jsonSchemaAttempts.map(createAttemptDebug));
+  let result = jsonSchemaAttempts[jsonSchemaAttempts.length - 1];
 
   if (
     !result.ok &&
@@ -1965,13 +2284,15 @@ async function requestJsonCompletion<T>({
       result.rawBody,
     )
   ) {
-    result = await requestChatCompletion(
+    const plainJsonAttempts = await requestChatCompletionWithRetries(
       endpoint,
       apiKey,
       basePayload,
       "plain_json",
+      runtimeSettings,
     );
-    attempts.push(createAttemptDebug(result));
+    attempts.push(...plainJsonAttempts.map(createAttemptDebug));
+    result = plainJsonAttempts[plainJsonAttempts.length - 1];
   }
 
   const debug: AIModelDebugData = {
@@ -2009,8 +2330,13 @@ async function requestJsonCompletion<T>({
 
 function createCachedFileContentLoader(
   repositoryContext: RepositoryAnalysisContext,
+  dataSourceOptions?: RepositoryDataSourceOptions,
 ): (path: string) => Promise<string> {
   const cache = new Map<string, Promise<string>>();
+  const dataSource = createRepositoryDataSource(
+    repositoryContext,
+    dataSourceOptions,
+  );
 
   return (path: string) => {
     const cached = cache.get(path);
@@ -2019,12 +2345,7 @@ function createCachedFileContentLoader(
       return cached;
     }
 
-    const request = getFileContent(
-      repositoryContext.owner,
-      repositoryContext.repo,
-      repositoryContext.branch,
-      path,
-    ).catch((error) => {
+    const request = dataSource.readFile(path).catch((error) => {
       cache.delete(path);
       throw error;
     });
@@ -2039,6 +2360,7 @@ async function expandFunctionOverviewFromRoot(args: {
   initialAnalyzedDepth: number;
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
   verifiedEntryPoint: string;
   promptFilePaths: string[];
   searchFilePaths: string[];
@@ -2053,19 +2375,20 @@ async function expandFunctionOverviewFromRoot(args: {
     ...args.root,
     filePath: args.root.filePath ?? args.verifiedEntryPoint,
     shouldDive: 1,
-    children: args.root.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
+    children: args.root.children.slice(0, args.runtimeSettings.maxKeySubFunctions),
   };
   const resolvedChildren: FunctionCallNode[] = [];
   let analyzedDepth = Math.max(1, args.initialAnalyzedDepth);
   const drillDownContext: FunctionDrillDownContext = {
     repositoryContext: args.repositoryContext,
     analysisResult: args.analysisResult,
+    runtimeSettings: args.runtimeSettings,
     promptFilePaths: args.promptFilePaths,
     searchFilePaths: args.searchFilePaths,
     bridgeRouteHandlers: collectFunctionCallBridgeRouteHandlers(args.root),
     projectIntroduction: args.projectIntroduction,
     loadFileContent: args.loadFileContent,
-    maxDepth: DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH,
+    maxDepth: args.runtimeSettings.maxDrillDownDepth,
     inProgressNodeKeys: new Set<string>(),
     resultCache: new Map<string, FunctionDrillDownResult>(),
     drillDownAttempts: [],
@@ -2140,6 +2463,7 @@ function buildDrillDownPromptPaths(args: {
 async function locateFunctionDefinition(args: {
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
   functionName: string;
   parentFunctionName: string;
   parentFilePath: string | null;
@@ -2189,7 +2513,7 @@ async function locateFunctionDefinition(args: {
 
     const matched = await requestJsonCompletion<FunctionLocationCandidateContentResult>(
       {
-        model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+        model: args.runtimeSettings.functionCallAnalysisModel,
         messages: [
           {
             role: "system",
@@ -2218,6 +2542,7 @@ async function locateFunctionDefinition(args: {
           unknown
         >,
         normalize: normalizeFunctionLocationCandidateContentResult,
+        runtimeSettings: args.runtimeSettings,
       },
     );
 
@@ -2301,7 +2626,7 @@ async function locateFunctionDefinition(args: {
 
   try {
     const guessed = await requestJsonCompletion<FunctionLocationGuessResult>({
-      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+      model: args.runtimeSettings.functionCallAnalysisModel,
       messages: buildFunctionLocationGuessMessages({
         repositoryContext: args.repositoryContext,
         analysisResult: args.analysisResult,
@@ -2314,6 +2639,7 @@ async function locateFunctionDefinition(args: {
       schemaName: "function_location_guess",
       schema: functionLocationGuessJsonSchema as Record<string, unknown>,
       normalize: normalizeFunctionLocationGuessResult,
+      runtimeSettings: args.runtimeSettings,
     });
 
     guessedPaths = Array.from(
@@ -2506,6 +2832,7 @@ async function drillDownFunctionNode(args: {
     const located = await locateFunctionDefinition({
       repositoryContext: context.repositoryContext,
       analysisResult: context.analysisResult,
+      runtimeSettings: context.runtimeSettings,
       functionName: node.name,
       parentFunctionName,
       parentFilePath,
@@ -2600,7 +2927,7 @@ async function drillDownFunctionNode(args: {
 
     try {
       const drillDown = await requestJsonCompletion<FunctionCallNode>({
-        model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+        model: context.runtimeSettings.functionCallAnalysisModel,
         messages: buildFunctionDrillDownMessages({
           repositoryContext: context.repositoryContext,
           analysisResult: context.analysisResult,
@@ -2615,6 +2942,7 @@ async function drillDownFunctionNode(args: {
         schemaName: "function_call_drill_down",
         schema: functionCallDrillDownJsonSchema as Record<string, unknown>,
         normalize: normalizeFunctionCallNode,
+        runtimeSettings: context.runtimeSettings,
       });
 
       context.drillDownAttempts.push({
@@ -2629,10 +2957,16 @@ async function drillDownFunctionNode(args: {
         model: drillDown.debug,
       });
 
-      const mergedChildren = mergeFunctionCallChildren([
-        ...drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
-        ...bridgeContinuationChildren,
-      ]);
+      const mergedChildren = mergeFunctionCallChildren(
+        [
+          ...drillDown.result.children.slice(
+            0,
+            context.runtimeSettings.maxKeySubFunctions,
+          ),
+          ...bridgeContinuationChildren,
+        ],
+        context.runtimeSettings.maxKeySubFunctions,
+      );
       const normalizedNode: FunctionCallNode = {
         ...drillDown.result,
         name: node.name,
@@ -2751,8 +3085,13 @@ async function drillDownFunctionNode(args: {
 async function loadProjectIntroductionExcerpt(args: {
   repositoryContext: RepositoryAnalysisContext;
   filePaths: string[];
+  dataSourceOptions?: RepositoryDataSourceOptions;
 }): Promise<ProjectIntroductionExcerpt> {
   const readmePath = findProjectIntroductionPath(args.filePaths);
+  const loadFileContent = createCachedFileContentLoader(
+    args.repositoryContext,
+    args.dataSourceOptions,
+  );
 
   if (!readmePath) {
     return {
@@ -2762,12 +3101,7 @@ async function loadProjectIntroductionExcerpt(args: {
   }
 
   try {
-    const content = await getFileContent(
-      args.repositoryContext.owner,
-      args.repositoryContext.repo,
-      args.repositoryContext.branch,
-      readmePath,
-    );
+    const content = await loadFileContent(readmePath);
 
     return {
       path: readmePath,
@@ -2788,9 +3122,16 @@ async function verifyEntryPoints(args: {
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
   availablePaths: Set<string>;
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
+  dataSourceOptions?: RepositoryDataSourceOptions;
 }): Promise<EntryVerificationOutcome> {
   const { repositoryContext, analysisResult, availablePaths } = args;
   const reviewAttempts: EntryPointReviewAttempt[] = [];
+  const loadFileContent = createCachedFileContentLoader(
+    repositoryContext,
+    args.dataSourceOptions,
+  );
+  const availableFilePaths = Array.from(availablePaths);
 
   for (const candidatePath of analysisResult.entryPoints) {
     if (!availablePaths.has(candidatePath)) {
@@ -2809,14 +3150,10 @@ async function verifyEntryPoints(args: {
     }
 
     let excerpt: PreparedFileExcerpt;
+    let fileContent: string;
 
     try {
-      const fileContent = await getFileContent(
-        repositoryContext.owner,
-        repositoryContext.repo,
-        repositoryContext.branch,
-        candidatePath,
-      );
+      fileContent = await loadFileContent(candidatePath);
       excerpt = prepareFileExcerpt(fileContent);
     } catch (error) {
       reviewAttempts.push({
@@ -2837,7 +3174,7 @@ async function verifyEntryPoints(args: {
 
     try {
       const review = await requestJsonCompletion<EntryPointReviewResult>({
-        model: DEFAULT_ENTRY_POINT_REVIEW_MODEL,
+        model: args.runtimeSettings.entryPointReviewModel,
         messages: buildEntryReviewMessages({
           repositoryContext,
           analysisResult,
@@ -2847,6 +3184,7 @@ async function verifyEntryPoints(args: {
         schemaName: "entry_point_review",
         schema: entryPointReviewJsonSchema as Record<string, unknown>,
         normalize: normalizeEntryPointReviewResult,
+        runtimeSettings: args.runtimeSettings,
       });
 
       const reviewAttempt: EntryPointReviewAttempt = {
@@ -2863,13 +3201,27 @@ async function verifyEntryPoints(args: {
       reviewAttempts.push(reviewAttempt);
 
       if (review.result.isEntryPoint) {
-        return {
+        const resolvedFrontendEntry = await resolveFrontendWrapperEntryPoint({
           verifiedEntryPoint: candidatePath,
-          verifiedEntryPointReason: review.result.reason,
+          entryContent: fileContent,
+          filePaths: availableFilePaths,
+          loadFileContent,
+        });
+        const verifiedEntryPoint =
+          resolvedFrontendEntry?.effectivePath ?? candidatePath;
+        const verifiedEntryPointReason = resolvedFrontendEntry
+          ? `${review.result.reason} 已沿前端包装层继续追踪：${resolvedFrontendEntry.chain.join(
+              " -> ",
+            )}，实际业务入口收敛到 ${verifiedEntryPoint}。`
+          : review.result.reason;
+
+        return {
+          verifiedEntryPoint,
+          verifiedEntryPointReason,
           debug: {
             attempts: reviewAttempts,
-            verifiedEntryPoint: candidatePath,
-            verifiedEntryPointReason: review.result.reason,
+            verifiedEntryPoint,
+            verifiedEntryPointReason,
           },
         };
       }
@@ -2908,6 +3260,8 @@ async function analyzeFunctionOverview(args: {
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
   filePaths: string[];
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
+  dataSourceOptions?: RepositoryDataSourceOptions;
 }): Promise<FunctionOverviewOutcome> {
   const { repositoryContext, analysisResult, filePaths } = args;
   const promptFilePaths = filePaths.slice(0, MAX_ANALYSIS_PATHS);
@@ -2915,8 +3269,12 @@ async function analyzeFunctionOverview(args: {
   const projectIntroduction = await loadProjectIntroductionExcerpt({
     repositoryContext,
     filePaths,
+    dataSourceOptions: args.dataSourceOptions,
   });
-  const loadFileContent = createCachedFileContentLoader(repositoryContext);
+  const loadFileContent = createCachedFileContentLoader(
+    repositoryContext,
+    args.dataSourceOptions,
+  );
 
   if (!verifiedEntryPoint) {
     return {
@@ -2935,6 +3293,8 @@ async function analyzeFunctionOverview(args: {
 
   let entryContent: string;
   let entryExcerpt: PreparedFileExcerpt;
+  let targetEntryPoint = verifiedEntryPoint;
+  let entryResolutionMessage: string | null = null;
 
   try {
     entryContent = await loadFileContent(verifiedEntryPoint);
@@ -2946,7 +3306,7 @@ async function analyzeFunctionOverview(args: {
     return {
       result: null,
       debug: {
-        targetEntryPoint: verifiedEntryPoint,
+        targetEntryPoint: targetEntryPoint,
         readmePath: projectIntroduction.path,
         status: "error",
         message: `${TEXT.functionOverviewEntryFileReadFailedPrefix}${
@@ -2959,9 +3319,42 @@ async function analyzeFunctionOverview(args: {
     };
   }
 
-  const bridge = await resolveFunctionCallBridge({
-    analysisResult,
+  const resolvedFrontendEntry = await resolveFrontendWrapperEntryPoint({
     verifiedEntryPoint,
+    entryContent,
+    filePaths,
+    loadFileContent,
+  });
+
+  if (resolvedFrontendEntry && resolvedFrontendEntry.effectivePath !== verifiedEntryPoint) {
+    targetEntryPoint = resolvedFrontendEntry.effectivePath;
+    entryResolutionMessage = `Detected a frontend wrapper chain: ${resolvedFrontendEntry.chain.join(
+      " -> ",
+    )}. Continued analysis from ${targetEntryPoint}.`;
+
+    try {
+      entryContent = await loadFileContent(targetEntryPoint);
+      entryExcerpt = prepareFileExcerpt(entryContent, {
+        directLineLimit: FUNCTION_ANALYSIS_FILE_DIRECT_READ_LINE_LIMIT,
+        segmentLineCount: FUNCTION_ANALYSIS_FILE_SEGMENT_LINE_COUNT,
+      });
+    } catch {
+      targetEntryPoint = verifiedEntryPoint;
+      entryResolutionMessage = null;
+    }
+  }
+
+  const effectiveAnalysisResult =
+    targetEntryPoint === verifiedEntryPoint
+      ? analysisResult
+      : {
+          ...analysisResult,
+          verifiedEntryPoint: targetEntryPoint,
+        };
+
+  const bridge = await resolveFunctionCallBridge({
+    analysisResult: effectiveAnalysisResult,
+    verifiedEntryPoint: targetEntryPoint,
     entryContent,
     filePaths,
     loadFileContent,
@@ -2972,8 +3365,9 @@ async function analyzeFunctionOverview(args: {
       root: bridge.root,
       initialAnalyzedDepth: 1,
       repositoryContext,
-      analysisResult,
-      verifiedEntryPoint,
+      analysisResult: effectiveAnalysisResult,
+      runtimeSettings: args.runtimeSettings,
+      verifiedEntryPoint: targetEntryPoint,
       promptFilePaths,
       searchFilePaths: filePaths,
       projectIntroduction,
@@ -2983,12 +3377,12 @@ async function analyzeFunctionOverview(args: {
     return {
       result: expandedOverview.overview,
       debug: {
-        targetEntryPoint: verifiedEntryPoint,
+        targetEntryPoint: targetEntryPoint,
         readmePath: projectIntroduction.path,
         status: "completed",
-        message: `Framework bridge matched: ${bridge.framework}. Connected the entrypoint to ${
-          bridge.handlerCount
-        } route handlers${
+        message: `${entryResolutionMessage ? `${entryResolutionMessage} ` : ""}Framework bridge matched: ${
+          bridge.framework
+        }. Connected the entrypoint to ${bridge.handlerCount} route handlers${
           bridge.truncated ? `, showing the first ${bridge.root.children.length}` : ""
         }.`,
         model: null,
@@ -3000,11 +3394,11 @@ async function analyzeFunctionOverview(args: {
 
   try {
     const overview = await requestJsonCompletion<FunctionCallOverview>({
-      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+      model: args.runtimeSettings.functionCallAnalysisModel,
       messages: buildFunctionOverviewMessages({
         repositoryContext,
-        analysisResult,
-        verifiedEntryPoint,
+        analysisResult: effectiveAnalysisResult,
+        verifiedEntryPoint: targetEntryPoint,
         entryExcerpt,
         projectIntroduction,
         filePaths: promptFilePaths,
@@ -3012,13 +3406,14 @@ async function analyzeFunctionOverview(args: {
       schemaName: "function_call_overview",
       schema: functionCallOverviewJsonSchema as Record<string, unknown>,
       normalize: normalizeFunctionCallOverview,
+      runtimeSettings: args.runtimeSettings,
     });
 
     if (!overview.result.root) {
       return {
         result: null,
         debug: {
-          targetEntryPoint: verifiedEntryPoint,
+          targetEntryPoint: targetEntryPoint,
           readmePath: projectIntroduction.path,
           status: "error",
           message: TEXT.functionOverviewRootMissing,
@@ -3033,8 +3428,9 @@ async function analyzeFunctionOverview(args: {
       root: overview.result.root,
       initialAnalyzedDepth: overview.result.analyzedDepth,
       repositoryContext,
-      analysisResult,
-      verifiedEntryPoint,
+      analysisResult: effectiveAnalysisResult,
+      runtimeSettings: args.runtimeSettings,
+      verifiedEntryPoint: targetEntryPoint,
       promptFilePaths,
       searchFilePaths: filePaths,
       projectIntroduction,
@@ -3044,14 +3440,14 @@ async function analyzeFunctionOverview(args: {
     return {
       result: expandedOverview.overview,
       debug: {
-        targetEntryPoint: verifiedEntryPoint,
+        targetEntryPoint: targetEntryPoint,
         readmePath: projectIntroduction.path,
         status: "completed",
         message: `已完成函数调用链递归分析，共识别 ${
           expandedOverview.overview.root
             ? countFunctionTreeNodes(expandedOverview.overview.root) - 1
             : 0
-        } 个非根节点，最大下钻层级 ${expandedOverview.overview.analyzedDepth}，配置上限 ${DEFAULT_FUNCTION_CALL_DRILL_DOWN_DEPTH}。`,
+        } 个非根节点，最大下钻层级 ${expandedOverview.overview.analyzedDepth}，配置上限 ${args.runtimeSettings.maxDrillDownDepth}。`,
         model: overview.debug,
         drillDownAttempts: expandedOverview.drillDownAttempts,
         cacheEvents: expandedOverview.cacheEvents,
@@ -3062,7 +3458,7 @@ async function analyzeFunctionOverview(args: {
       return {
         result: null,
         debug: {
-          targetEntryPoint: verifiedEntryPoint,
+          targetEntryPoint: targetEntryPoint,
           readmePath: projectIntroduction.path,
           status: "error",
           message: error.message,
@@ -3081,6 +3477,7 @@ async function analyzeFunctionModules(args: {
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
   overview: FunctionCallOverview | null;
+  runtimeSettings: OpenAICompatibleRuntimeSettings;
 }): Promise<FunctionModuleOutcome> {
   const { repositoryContext, analysisResult, overview } = args;
 
@@ -3107,7 +3504,7 @@ async function analyzeFunctionModules(args: {
   try {
     const moduleAnalysis = await requestJsonCompletion<FunctionModuleAnalysisResult>(
       {
-        model: DEFAULT_FUNCTION_MODULE_ANALYSIS_MODEL,
+        model: args.runtimeSettings.functionModuleAnalysisModel,
         messages: buildFunctionModuleAnalysisMessages({
           repositoryContext,
           analysisResult,
@@ -3116,6 +3513,7 @@ async function analyzeFunctionModules(args: {
         schemaName: "function_module_analysis",
         schema: functionModuleAnalysisJsonSchema as Record<string, unknown>,
         normalize: normalizeFunctionModuleAnalysisResult,
+        runtimeSettings: args.runtimeSettings,
       },
     );
     const selectedModuleAnalysis = shouldPreferHeuristicFunctionModules({
@@ -3175,13 +3573,17 @@ export async function drillDownFunctionOverviewNode(args: {
   repositoryContext: RepositoryAnalysisContext;
   analysisResult: AIAnalysisResult;
   nodePath: number[];
+  settings?: AppSettingsInput;
 }): Promise<{ result: AIAnalysisResult; debug: FunctionCallAnalysisDebugData }> {
   const { filePaths, repositoryContext, analysisResult, nodePath } = args;
+  const runtimeSettings = getOpenAICompatibleRuntimeSettings(args.settings);
+  const dataSourceOptions = createRepositoryDataSourceOptions(args.settings);
   const overview = analysisResult.functionCallOverview;
   const promptFilePaths = filePaths.slice(0, MAX_ANALYSIS_PATHS);
   const projectIntroduction = await loadProjectIntroductionExcerpt({
     repositoryContext,
     filePaths,
+    dataSourceOptions,
   });
   const targetEntryPoint =
     analysisResult.verifiedEntryPoint ?? overview?.root?.filePath ?? null;
@@ -3247,7 +3649,10 @@ export async function drillDownFunctionOverviewNode(args: {
     };
   }
 
-  const loadFileContent = createCachedFileContentLoader(repositoryContext);
+  const loadFileContent = createCachedFileContentLoader(
+    repositoryContext,
+    dataSourceOptions,
+  );
   const nodeKey = buildDepthAwareDrillDownVisitKey(
     resolvedNode.node,
     resolvedNode.depth,
@@ -3257,6 +3662,7 @@ export async function drillDownFunctionOverviewNode(args: {
   const located = await locateFunctionDefinition({
     repositoryContext,
     analysisResult,
+    runtimeSettings,
     functionName: resolvedNode.node.name,
     parentFunctionName: resolvedNode.parentFunctionName,
     parentFilePath: resolvedNode.parentFilePath,
@@ -3313,7 +3719,7 @@ export async function drillDownFunctionOverviewNode(args: {
 
   try {
     const drillDown = await requestJsonCompletion<FunctionCallNode>({
-      model: DEFAULT_FUNCTION_CALL_ANALYSIS_MODEL,
+      model: runtimeSettings.functionCallAnalysisModel,
       messages: buildFunctionDrillDownMessages({
         repositoryContext,
         analysisResult,
@@ -3328,12 +3734,19 @@ export async function drillDownFunctionOverviewNode(args: {
       schemaName: "function_call_drill_down",
       schema: functionCallDrillDownJsonSchema as Record<string, unknown>,
       normalize: normalizeFunctionCallNode,
+      runtimeSettings,
     });
 
-    const mergedChildren = mergeFunctionCallChildren([
-      ...drillDown.result.children.slice(0, MAX_KEY_SUB_FUNCTIONS),
-      ...bridgeContinuationChildren,
-    ]);
+    const mergedChildren = mergeFunctionCallChildren(
+      [
+        ...drillDown.result.children.slice(
+          0,
+          runtimeSettings.maxKeySubFunctions,
+        ),
+        ...bridgeContinuationChildren,
+      ],
+      runtimeSettings.maxKeySubFunctions,
+    );
     const nextChildren = flattenToOneLayerChildren(
       mergedChildren,
       resolvedNode.node.moduleId,
@@ -3430,19 +3843,23 @@ export class AIAnalysisServiceError extends Error {
 export async function analyzeRepository(args: {
   filePaths: string[];
   repositoryContext: RepositoryAnalysisContext;
+  settings?: AppSettingsInput;
 }): Promise<{ result: AIAnalysisResult; debug: RepositoryAnalysisDebugData }> {
   const { filePaths, repositoryContext } = args;
+  const runtimeSettings = getOpenAICompatibleRuntimeSettings(args.settings);
+  const dataSourceOptions = createRepositoryDataSourceOptions(args.settings);
   const samplePaths = filePaths.slice(0, MAX_ANALYSIS_PATHS);
 
   let repositoryAnalysis: { result: AIAnalysisResult; debug: AIModelDebugData };
 
   try {
     repositoryAnalysis = await requestJsonCompletion<AIAnalysisResult>({
-      model: DEFAULT_REPOSITORY_ANALYSIS_MODEL,
+      model: runtimeSettings.repositoryAnalysisModel,
       messages: buildRepositoryAnalysisMessages(samplePaths),
       schemaName: "repository_analysis",
       schema: aiAnalysisJsonSchema as Record<string, unknown>,
       normalize: normalizeAIAnalysisResult,
+      runtimeSettings,
     });
   } catch (error) {
     if (error instanceof AIModelInvocationError) {
@@ -3461,6 +3878,8 @@ export async function analyzeRepository(args: {
     repositoryContext,
     analysisResult: repositoryAnalysis.result,
     availablePaths: new Set(filePaths),
+    runtimeSettings,
+    dataSourceOptions,
   });
 
   const baseAnalysisResult: AIAnalysisResult = {
@@ -3475,6 +3894,8 @@ export async function analyzeRepository(args: {
     repositoryContext,
     analysisResult: baseAnalysisResult,
     filePaths,
+    runtimeSettings,
+    dataSourceOptions,
   });
 
   const moduleAnalysis = await analyzeFunctionModules({
@@ -3484,6 +3905,7 @@ export async function analyzeRepository(args: {
       functionCallOverview: functionOverview.result,
     },
     overview: functionOverview.result,
+    runtimeSettings,
   });
 
   return {

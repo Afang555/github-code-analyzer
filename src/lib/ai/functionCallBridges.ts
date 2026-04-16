@@ -11,6 +11,17 @@ import {
 } from "@/lib/functionCallBridgeUtils";
 
 const MAX_BRIDGED_HANDLER_NODES = 20;
+const MAX_FRONTEND_ENTRY_CHAIN_DEPTH = 4;
+const JAVASCRIPT_MODULE_EXTENSIONS = [
+  ".tsx",
+  ".ts",
+  ".jsx",
+  ".js",
+  ".mts",
+  ".cts",
+  ".mjs",
+  ".cjs",
+] as const;
 
 export type FunctionCallBridgeContext = {
   analysisResult: AIAnalysisResult;
@@ -26,6 +37,11 @@ export type ResolvedFunctionCallBridge = {
   root: FunctionCallNode;
   handlerCount: number;
   truncated: boolean;
+};
+
+export type ResolvedFrontendWrapperEntryPoint = {
+  effectivePath: string;
+  chain: string[];
 };
 
 export type FunctionCallBridgeContinuationContext = {
@@ -235,6 +251,64 @@ export async function resolveFunctionCallBridge(
   return null;
 }
 
+export async function resolveFrontendWrapperEntryPoint(args: {
+  verifiedEntryPoint: string;
+  entryContent: string;
+  filePaths: string[];
+  loadFileContent: (path: string) => Promise<string>;
+}): Promise<ResolvedFrontendWrapperEntryPoint | null> {
+  if (!isJavaScriptModulePath(args.verifiedEntryPoint)) {
+    return null;
+  }
+
+  const filePathLookup = createFilePathLookup(args.filePaths);
+  const chain = [args.verifiedEntryPoint];
+  const visited = new Set<string>([
+    normalizeRepoPath(args.verifiedEntryPoint).toLowerCase(),
+  ]);
+  let currentPath = args.verifiedEntryPoint;
+  let currentContent = args.entryContent;
+
+  for (let depth = 0; depth < MAX_FRONTEND_ENTRY_CHAIN_DEPTH; depth += 1) {
+    const nextTarget = resolveFrontendWrapperTarget({
+      filePath: currentPath,
+      content: currentContent,
+      filePathLookup,
+    });
+
+    if (!nextTarget) {
+      break;
+    }
+
+    const normalizedNextPath = normalizeRepoPath(nextTarget.filePath).toLowerCase();
+    if (visited.has(normalizedNextPath)) {
+      break;
+    }
+
+    let nextContent: string;
+
+    try {
+      nextContent = await args.loadFileContent(nextTarget.filePath);
+    } catch {
+      break;
+    }
+
+    chain.push(nextTarget.filePath);
+    visited.add(normalizedNextPath);
+    currentPath = nextTarget.filePath;
+    currentContent = nextContent;
+  }
+
+  if (chain.length < 2) {
+    return null;
+  }
+
+  return {
+    effectivePath: chain[chain.length - 1]!,
+    chain,
+  };
+}
+
 export function collectFunctionCallBridgeRouteHandlers(
   root: FunctionCallNode | null,
 ): FunctionCallNode[] {
@@ -312,6 +386,266 @@ function createRouteFrameworkBridge(
       };
     },
   };
+}
+
+function resolveFrontendWrapperTarget(args: {
+  filePath: string;
+  content: string;
+  filePathLookup: FilePathLookup;
+}): {
+  filePath: string;
+} | null {
+  if (!isThinFrontendWrapperContent(args.content)) {
+    return null;
+  }
+
+  const importMap = collectJavaScriptLocalImportMap(args);
+  if (importMap.size === 0) {
+    return null;
+  }
+
+  const projectTargetCandidates = Array.from(
+    new Map(
+      collectImportedJsxUsages(args.content, importMap).map((item) => [
+        `${item.symbol}::${item.filePath}`,
+        item,
+      ]),
+    ).values(),
+  );
+
+  if (projectTargetCandidates.length !== 1) {
+    return null;
+  }
+
+  return {
+    filePath: projectTargetCandidates[0]!.filePath,
+  };
+}
+
+function collectJavaScriptLocalImportMap(args: {
+  filePath: string;
+  content: string;
+  filePathLookup: FilePathLookup;
+}): Map<string, string> {
+  const importMap = new Map<string, string>();
+
+  for (const match of args.content.matchAll(
+    /\bimport\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/g,
+  )) {
+    const source = match[2]?.trim() ?? "";
+    const resolvedFilePath = resolveProjectModulePath({
+      fromFilePath: args.filePath,
+      modulePath: source,
+      filePathLookup: args.filePathLookup,
+    });
+
+    if (!resolvedFilePath) {
+      continue;
+    }
+
+    for (const alias of extractJavaScriptImportAliases(match[1] ?? "")) {
+      importMap.set(alias, resolvedFilePath);
+    }
+  }
+
+  for (const match of args.content.matchAll(
+    /\b(?:const|let|var)\s+([A-Z][A-Za-z0-9_$]*)\s*=\s*(?:dynamic|lazy)\s*\(\s*[\s\S]*?import\s*\(\s*["']([^"']+)["']\s*\)/g,
+  )) {
+    const alias = match[1]?.trim() ?? "";
+    const source = match[2]?.trim() ?? "";
+    const resolvedFilePath = resolveProjectModulePath({
+      fromFilePath: args.filePath,
+      modulePath: source,
+      filePathLookup: args.filePathLookup,
+    });
+
+    if (!alias || !resolvedFilePath) {
+      continue;
+    }
+
+    importMap.set(alias, resolvedFilePath);
+  }
+
+  return importMap;
+}
+
+function extractJavaScriptImportAliases(clause: string): string[] {
+  const aliases = new Set<string>();
+  const normalizedClause = clause.trim().replace(/^type\s+/, "");
+
+  if (!normalizedClause) {
+    return [];
+  }
+
+  const namespaceMatch = normalizedClause.match(/\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)/);
+  if (namespaceMatch?.[1]) {
+    aliases.add(namespaceMatch[1]);
+  }
+
+  const namedBlockMatch = normalizedClause.match(/\{([\s\S]*?)\}/);
+  if (namedBlockMatch?.[1]) {
+    for (const item of namedBlockMatch[1].split(",")) {
+      const normalizedItem = item.trim().replace(/^type\s+/, "");
+
+      if (!normalizedItem) {
+        continue;
+      }
+
+      const aliasMatch = normalizedItem.match(
+        /^([A-Za-z_$][A-Za-z0-9_$]*)(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?$/,
+      );
+
+      if (!aliasMatch) {
+        continue;
+      }
+
+      aliases.add(aliasMatch[2] ?? aliasMatch[1]);
+    }
+  }
+
+  const defaultImportPart = namedBlockMatch
+    ? normalizedClause.slice(0, namedBlockMatch.index).replace(/,$/, "").trim()
+    : normalizedClause;
+
+  if (
+    defaultImportPart &&
+    !defaultImportPart.startsWith("*") &&
+    /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(defaultImportPart)
+  ) {
+    aliases.add(defaultImportPart);
+  }
+
+  return Array.from(aliases);
+}
+
+function collectImportedJsxUsages(
+  content: string,
+  importMap: Map<string, string>,
+): Array<{
+  symbol: string;
+  filePath: string;
+}> {
+  const usages: Array<{
+    symbol: string;
+    filePath: string;
+  }> = [];
+
+  for (const match of content.matchAll(/<([A-Z][A-Za-z0-9_$]*)\b/g)) {
+    const symbol = match[1] ?? "";
+    const filePath = importMap.get(symbol);
+
+    if (!filePath) {
+      continue;
+    }
+
+    usages.push({
+      symbol,
+      filePath,
+    });
+  }
+
+  return usages;
+}
+
+function resolveProjectModulePath(args: {
+  fromFilePath: string;
+  modulePath: string;
+  filePathLookup: FilePathLookup;
+}): string | null {
+  const modulePath = args.modulePath.trim();
+
+  if (!modulePath) {
+    return null;
+  }
+
+  let basePath: string | null = null;
+
+  if (modulePath.startsWith("@/")) {
+    basePath = modulePath.slice(2);
+  } else if (modulePath.startsWith("./") || modulePath.startsWith("../")) {
+    const normalizedFromPath = normalizeRepoPath(args.fromFilePath);
+    const baseDirectory = normalizedFromPath.replace(/\/[^/]+$/, "");
+    basePath = resolveRelativeRepoPath(baseDirectory, modulePath);
+  } else if (/^(?:src|app)\//.test(modulePath)) {
+    basePath = normalizeRepoPath(modulePath);
+  }
+
+  if (!basePath) {
+    return null;
+  }
+
+  for (const candidate of buildJavaScriptModuleCandidates(basePath)) {
+    const resolved = args.filePathLookup.get(candidate.toLowerCase());
+
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function buildJavaScriptModuleCandidates(basePath: string): string[] {
+  const normalizedBasePath = normalizeRepoPath(basePath);
+  const basePathHasExtension = /\.[A-Za-z0-9]+$/.test(normalizedBasePath);
+
+  if (basePathHasExtension) {
+    return [normalizedBasePath];
+  }
+
+  return Array.from(
+    new Set([
+      normalizedBasePath,
+      ...JAVASCRIPT_MODULE_EXTENSIONS.map((extension) => `${normalizedBasePath}${extension}`),
+      ...JAVASCRIPT_MODULE_EXTENSIONS.map(
+        (extension) => `${normalizedBasePath}/index${extension}`,
+      ),
+    ]),
+  );
+}
+
+function resolveRelativeRepoPath(baseDirectory: string, relativePath: string): string {
+  const segments = normalizeRepoPath(baseDirectory).split("/").filter(Boolean);
+
+  for (const segment of normalizeRepoPath(relativePath).split("/")) {
+    if (!segment || segment === ".") {
+      continue;
+    }
+
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+
+    segments.push(segment);
+  }
+
+  return segments.join("/");
+}
+
+function isJavaScriptModulePath(filePath: string): boolean {
+  const loweredPath = normalizeRepoPath(filePath).toLowerCase();
+  return JAVASCRIPT_MODULE_EXTENSIONS.some((extension) =>
+    loweredPath.endsWith(extension),
+  );
+}
+
+function isThinFrontendWrapperContent(content: string): boolean {
+  const functionDeclarationCount = Array.from(
+    content.matchAll(/\bfunction\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\(/g),
+  ).length;
+  const arrowFunctionCount = Array.from(
+    content.matchAll(
+      /\b(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/g,
+    ),
+  ).length;
+  const hookUsageCount = Array.from(
+    content.matchAll(
+      /\buse(?:State|Effect|LayoutEffect|Memo|Callback|Ref|Reducer|Transition|DeferredValue|Optimistic|ActionState|ImperativeHandle)\s*\(/g,
+    ),
+  ).length;
+
+  return functionDeclarationCount + arrowFunctionCount <= 3 && hookUsageCount === 0;
 }
 
 function buildFlaskUrlForContinuationChildren(
@@ -2368,10 +2702,34 @@ function deduplicateFunctionCallNodes(nodes: FunctionCallNode[]): FunctionCallNo
 }
 
 function cloneFunctionCallBridgeNode(node: FunctionCallNode): FunctionCallNode {
-  return {
+  return cloneFunctionCallBridgeNodeWithSeen(
+    node,
+    new WeakMap<object, FunctionCallNode>(),
+  );
+}
+
+function cloneFunctionCallBridgeNodeWithSeen(
+  node: FunctionCallNode,
+  seen: WeakMap<object, FunctionCallNode>,
+): FunctionCallNode {
+  const cached = seen.get(node);
+
+  if (cached) {
+    return {
+      ...cached,
+      children: [],
+    };
+  }
+
+  const clone: FunctionCallNode = {
     ...node,
-    children: node.children.map((child) => cloneFunctionCallBridgeNode(child)),
+    children: [],
   };
+  seen.set(node, clone);
+  clone.children = node.children.map((child) =>
+    cloneFunctionCallBridgeNodeWithSeen(child, seen),
+  );
+  return clone;
 }
 
 function makeFunctionCallNodeKey(

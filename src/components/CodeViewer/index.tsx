@@ -5,7 +5,9 @@ import { AlertCircle, FileCode2, Loader2 } from "lucide-react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
-import { getFileContent } from "@/services/githubService";
+import { getFileContent } from "@/services/repositoryService";
+import type { AppSettingsInput } from "@/lib/appSettings";
+import type { RepositoryContext } from "@/types/repository";
 
 const TEXT = {
   loadFailed: "\u52a0\u8f7d\u6587\u4ef6\u5185\u5bb9\u5931\u8d25",
@@ -13,26 +15,32 @@ const TEXT = {
 } as const;
 
 interface CodeViewerProps {
-  owner: string;
-  repo: string;
-  branch: string;
+  repositoryContext: RepositoryContext | null;
   path: string;
+  appSettings?: AppSettingsInput;
 }
 
-export function CodeViewer({ owner, repo, branch, path }: CodeViewerProps) {
+export function CodeViewer({
+  repositoryContext,
+  path,
+  appSettings,
+}: CodeViewerProps) {
   const [content, setContent] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     async function fetchContent() {
-      if (!path) return;
+      if (!repositoryContext || !path) {
+        setContent(null);
+        return;
+      }
 
       setIsLoading(true);
       setError(null);
 
       try {
-        const text = await getFileContent(owner, repo, branch, path);
+        const text = await getFileContent(repositoryContext, path, appSettings);
         setContent(text);
       } catch (err) {
         setError(err instanceof Error ? err.message : TEXT.loadFailed);
@@ -43,7 +51,7 @@ export function CodeViewer({ owner, repo, branch, path }: CodeViewerProps) {
     }
 
     void fetchContent();
-  }, [owner, repo, branch, path]);
+  }, [appSettings, path, repositoryContext]);
 
   const getLanguage = (fileName: string) => {
     const ext = fileName.split(".").pop()?.toLowerCase();

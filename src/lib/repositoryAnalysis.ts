@@ -1,4 +1,4 @@
-import type { FileNode } from "@/services/githubService";
+import type { FileNode } from "@/types/repository";
 
 const IGNORED_DIRECTORIES = new Set([
   ".git",

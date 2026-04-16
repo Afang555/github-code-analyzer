@@ -28,7 +28,7 @@ import type {
 } from "@/types/aiAnalysis";
 
 const CARD_WIDTH = 272;
-const CARD_HEIGHT = 156;
+const CARD_HEIGHT = 196;
 const COLUMN_GAP = 128;
 const VERTICAL_GAP = 28;
 const SCENE_PADDING = 40;
@@ -340,7 +340,7 @@ const FunctionNodeCard = memo(function FunctionNodeCard({
       }}
       disabled={!canOpenFile}
       className={cn(
-        "function-node-card flex h-[156px] w-[272px] flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left transition-[transform,opacity,filter,box-shadow] dark:border-slate-100 dark:bg-[#191c22]",
+        "function-node-card flex flex-col overflow-hidden rounded-[24px] border-2 border-slate-900 bg-white text-left transition-[transform,opacity,filter,box-shadow] dark:border-slate-100 dark:bg-[#191c22]",
         isInteracting
           ? "shadow-none transition-none"
           : "shadow-[0_10px_24px_rgba(15,23,42,0.12)]",
@@ -356,6 +356,10 @@ const FunctionNodeCard = memo(function FunctionNodeCard({
           "ring-4 ring-blue-200/70 dark:border-blue-300 dark:ring-blue-500/30",
         isDimmed && (isInteracting ? "opacity-45" : "opacity-30 saturate-0"),
       )}
+      style={{
+        width: `${CARD_WIDTH}px`,
+        height: `${CARD_HEIGHT}px`,
+      }}
     >
       <div
         className="border-b-2 px-4 py-2 text-[15px] font-medium tracking-wide"
@@ -370,7 +374,7 @@ const FunctionNodeCard = memo(function FunctionNodeCard({
         </span>
       </div>
 
-      <div className="flex flex-1 flex-col gap-2 px-4 py-3">
+      <div className="flex min-h-0 flex-1 flex-col gap-2 px-4 py-3">
         <div className="relative min-h-[22px] pr-[74px]">
           <h3
             className={cn(
@@ -406,12 +410,11 @@ const FunctionNodeCard = memo(function FunctionNodeCard({
         )}
 
         <p
-          className="text-sm leading-6 text-slate-700 dark:text-slate-200"
+          className="min-h-0 overflow-hidden text-sm leading-6 text-slate-700 dark:text-slate-200"
           style={{
             display: "-webkit-box",
             WebkitLineClamp: routeLabel ? 2 : 3,
             WebkitBoxOrient: "vertical",
-            overflow: "hidden",
           }}
           title={node.summary}
         >
@@ -740,7 +743,13 @@ export function FunctionOverviewPanel({
             top: `${layoutNode.y}px`,
           }}
         >
-          <div className="relative h-[156px] w-[272px]">
+          <div
+            className="relative"
+            style={{
+              width: `${CARD_WIDTH}px`,
+              height: `${CARD_HEIGHT}px`,
+            }}
+          >
             <FunctionNodeCard
               node={layoutNode.node}
               depth={layoutNode.depth}

@@ -131,6 +131,13 @@ OPENAI_COMPAT_MODEL=gpt-5.4
 # OPENAI_COMPAT_FUNCTION_MODEL=gpt-5.4
 # Drill-down depth starts at direct children of the entry function as level 1.
 # OPENAI_COMPAT_FUNCTION_MAX_DEPTH=2
+# Network / timeout tuning for slower OpenAI-compatible providers.
+# OPENAI_COMPAT_CONNECT_TIMEOUT_MS=30000
+# OPENAI_COMPAT_REQUEST_TIMEOUT_MS=120000
+# OPENAI_COMPAT_HEADERS_TIMEOUT_MS=120000
+# OPENAI_COMPAT_BODY_TIMEOUT_MS=120000
+# OPENAI_COMPAT_RETRY_COUNT=2
+# OPENAI_COMPAT_RETRY_BACKOFF_MS=1500
 # GITHUB_TOKEN=github_pat_xxx
 ```
 
@@ -159,3 +166,4 @@ npm run start
 - Entry-point verification reuses `OPENAI_COMPAT_MODEL` by default unless `OPENAI_COMPAT_ENTRY_MODEL` is set
 - Function-level key child analysis also reuses `OPENAI_COMPAT_MODEL` by default unless `OPENAI_COMPAT_FUNCTION_MODEL` is set
 - Recursive drill-down depth defaults to `2` (entry child level is counted as level `1`) and can be overridden with `OPENAI_COMPAT_FUNCTION_MAX_DEPTH`
+- If your provider is slow to establish connections or occasionally returns `fetch failed` / `Connect Timeout`, tune `OPENAI_COMPAT_CONNECT_TIMEOUT_MS`, `OPENAI_COMPAT_REQUEST_TIMEOUT_MS`, and `OPENAI_COMPAT_RETRY_COUNT`

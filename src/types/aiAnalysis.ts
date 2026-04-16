@@ -1,10 +1,6 @@
-export interface RepositoryAnalysisContext {
-  owner: string;
-  repo: string;
-  branch: string;
-  repositoryUrl: string;
-  repositoryDescription?: string | null;
-}
+import type { RepositoryContext } from "@/types/repository";
+
+export type RepositoryAnalysisContext = RepositoryContext;
 
 export type FunctionShouldDive = -1 | 0 | 1;
 
@@ -172,6 +168,10 @@ export interface AnalyzeRepoDrillDownErrorResponse {
   error: string;
   debug?: AnalyzeRepoDrillDownDebugData;
 }
+
+const MAX_NORMALIZED_FUNCTION_CALL_DEPTH = 8;
+const MAX_NORMALIZED_FUNCTION_CALL_CHILDREN = 24;
+const MAX_NORMALIZED_FUNCTION_CALL_NODES = 400;
 
 const TEXT = {
   primaryLanguagesDesc: "根据仓库路径推断出的主要编程语言列表。",
@@ -520,8 +520,34 @@ export function normalizeFunctionModules(value: unknown): FunctionModule[] {
 }
 
 export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
+  return normalizeFunctionCallNodeWithContext(value, {
+    depth: 0,
+    seen: new WeakSet<object>(),
+    counter: { value: 0 },
+  });
+}
+
+function normalizeFunctionCallNodeWithContext(
+  value: unknown,
+  context: {
+    depth: number;
+    seen: WeakSet<object>;
+    counter: { value: number };
+  },
+): FunctionCallNode {
   if (!value || typeof value !== "object") {
     throw new Error(TEXT.functionNodeObjectRequired);
+  }
+
+  if (context.seen.has(value)) {
+    throw new Error("Function call node contains a circular reference.");
+  }
+
+  context.seen.add(value);
+  context.counter.value += 1;
+
+  if (context.counter.value > MAX_NORMALIZED_FUNCTION_CALL_NODES) {
+    throw new Error("Function call tree is too large to normalize safely.");
   }
 
   const node = value as Record<string, unknown>;
@@ -544,6 +570,19 @@ export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
     throw new Error(TEXT.functionNodeChildrenRequired);
   }
 
+  const normalizedChildren =
+    context.depth >= MAX_NORMALIZED_FUNCTION_CALL_DEPTH
+      ? []
+      : node.children
+          .slice(0, MAX_NORMALIZED_FUNCTION_CALL_CHILDREN)
+          .map((child) =>
+            normalizeFunctionCallNodeWithContext(child, {
+              depth: context.depth + 1,
+              seen: context.seen,
+              counter: context.counter,
+            }),
+          );
+
   return {
     name: name.trim(),
     filePath: normalizeOptionalString(node.filePath),
@@ -551,7 +590,7 @@ export function normalizeFunctionCallNode(value: unknown): FunctionCallNode {
     moduleId: normalizeOptionalString(node.moduleId),
     bridgeMetadata: normalizeFunctionCallBridgeMetadata(node.bridgeMetadata),
     shouldDive: node.shouldDive,
-    children: node.children.map((child) => normalizeFunctionCallNode(child)),
+    children: normalizedChildren,
   };
 }
 

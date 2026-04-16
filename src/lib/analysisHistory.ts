@@ -1,4 +1,3 @@
-import type { FileNode } from "@/types/github";
 import {
   normalizeAIAnalysisResult,
   normalizeFunctionCallOverview,
@@ -8,6 +7,7 @@ import {
   type FunctionCallOverview,
   type FunctionModule,
 } from "@/types/aiAnalysis";
+import type { RepositorySourceType } from "@/types/repository";
 
 const ANALYSIS_HISTORY_STORAGE_KEY = "github-code-analyzer:analysis-history:v1";
 const ANALYSIS_HISTORY_UPDATED_EVENT =
@@ -32,7 +32,9 @@ export type AnalysisWorkLogEntry = {
   jsonSections?: AnalysisWorkLogJsonSection[];
 };
 
-export type AnalysisHistoryRepoInfo = {
+export type GitHubAnalysisHistoryRepoInfo = {
+  sourceType: "github";
+  projectName: string;
   owner: string;
   repo: string;
   branch: string;
@@ -40,12 +42,23 @@ export type AnalysisHistoryRepoInfo = {
   description: string | null;
 };
 
-export type AnalysisHistoryRecord = {
-  id: string;
+export type LocalAnalysisHistoryRepoInfo = {
+  sourceType: "local";
   projectName: string;
-  owner: string;
-  repo: string;
-  branch: string;
+  sourceId: string;
+  localPath: string;
+  repositoryUrl: string;
+  description: string | null;
+};
+
+export type AnalysisHistoryRepoInfo =
+  | GitHubAnalysisHistoryRepoInfo
+  | LocalAnalysisHistoryRepoInfo;
+
+type AnalysisHistoryRecordBase = {
+  id: string;
+  sourceType: RepositorySourceType;
+  projectName: string;
   repositoryUrl: string;
   description: string | null;
   createdAt: string;
@@ -57,6 +70,35 @@ export type AnalysisHistoryRecord = {
   markdown: string;
   workLogs: AnalysisWorkLogEntry[];
 };
+
+export type GitHubAnalysisHistoryRecord = AnalysisHistoryRecordBase & {
+  sourceType: "github";
+  owner: string;
+  repo: string;
+  branch: string;
+};
+
+export type LocalAnalysisHistoryRecord = AnalysisHistoryRecordBase & {
+  sourceType: "local";
+  sourceId: string;
+  localPath: string;
+};
+
+export type AnalysisHistoryRecord =
+  | GitHubAnalysisHistoryRecord
+  | LocalAnalysisHistoryRecord;
+
+type GitHubAnalysisHistoryMarkdownRecord = Omit<
+  GitHubAnalysisHistoryRecord,
+  "markdown"
+>;
+type LocalAnalysisHistoryMarkdownRecord = Omit<
+  LocalAnalysisHistoryRecord,
+  "markdown"
+>;
+type AnalysisHistoryMarkdownRecord =
+  | GitHubAnalysisHistoryMarkdownRecord
+  | LocalAnalysisHistoryMarkdownRecord;
 
 const EMPTY_ANALYSIS_HISTORY_SNAPSHOT: AnalysisHistoryRecord[] = [];
 let cachedHistoryRawPayload: string | null = null;
@@ -77,6 +119,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function coerceString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function normalizeOptionalString(value: unknown): string | null {
+  const normalized = coerceString(value).trim();
+  return normalized || null;
+}
+
+function inferRecordSourceType(
+  value: Record<string, unknown>,
+): RepositorySourceType | null {
+  if (value.sourceType === "github" || value.sourceType === "local") {
+    return value.sourceType;
+  }
+
+  if (
+    normalizeOptionalString(value.owner) &&
+    normalizeOptionalString(value.repo) &&
+    normalizeOptionalString(value.branch)
+  ) {
+    return "github";
+  }
+
+  if (
+    normalizeOptionalString(value.sourceId) &&
+    (normalizeOptionalString(value.localPath) ||
+      normalizeOptionalString(value.repositoryUrl))
+  ) {
+    return "local";
+  }
+
+  return null;
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -193,15 +266,12 @@ function normalizeRecord(value: unknown): AnalysisHistoryRecord | null {
     return null;
   }
 
-  const owner = coerceString(value.owner).trim();
-  const repo = coerceString(value.repo).trim();
-  const branch = coerceString(value.branch).trim();
-  const repositoryUrl = coerceString(value.repositoryUrl).trim();
-
-  if (!owner || !repo || !branch || !repositoryUrl) {
+  const sourceType = inferRecordSourceType(value);
+  if (!sourceType) {
     return null;
   }
 
+  const description = normalizeOptionalString(value.description);
   const createdAt = coerceString(value.createdAt).trim() || new Date().toISOString();
   const updatedAt = coerceString(value.updatedAt).trim() || createdAt;
   const fileList = normalizeFileList(value.fileList);
@@ -233,28 +303,91 @@ function normalizeRecord(value: unknown): AnalysisHistoryRecord | null {
     normalizedResult?.primaryLanguages ?? normalizeStringArray(value.primaryLanguages);
   const techStack = normalizedResult?.techStack ?? normalizeStringArray(value.techStack);
 
-  const record: AnalysisHistoryRecord = {
-    id:
-      coerceString(value.id).trim() ||
-      buildAnalysisHistoryRecordId({ owner, repo, branch }),
-    projectName: coerceString(value.projectName).trim() || repo,
-    owner,
-    repo,
-    branch,
-    repositoryUrl,
-    description:
-      typeof value.description === "string" && value.description.trim()
-        ? value.description
-        : null,
-    createdAt,
-    updatedAt,
-    fileList,
-    analysisResult: normalizedResult,
-    primaryLanguages,
-    techStack,
-    markdown: "",
-    workLogs,
-  };
+  let record: AnalysisHistoryRecord;
+
+  if (sourceType === "github") {
+    const owner = normalizeOptionalString(value.owner);
+    const repo = normalizeOptionalString(value.repo);
+    const branch = normalizeOptionalString(value.branch);
+    const repositoryUrl = normalizeOptionalString(value.repositoryUrl);
+
+    if (!owner || !repo || !branch || !repositoryUrl) {
+      return null;
+    }
+
+    const projectName = normalizeOptionalString(value.projectName) ?? repo;
+
+    record = {
+      id:
+        normalizeOptionalString(value.id) ??
+        buildAnalysisHistoryRecordId({
+          sourceType: "github",
+          projectName,
+          owner,
+          repo,
+          branch,
+          repositoryUrl,
+          description,
+        }),
+      sourceType: "github",
+      projectName,
+      owner,
+      repo,
+      branch,
+      repositoryUrl,
+      description,
+      createdAt,
+      updatedAt,
+      fileList,
+      analysisResult: normalizedResult,
+      primaryLanguages,
+      techStack,
+      markdown: "",
+      workLogs,
+    };
+  } else {
+    const sourceId = normalizeOptionalString(value.sourceId);
+    const localPath =
+      normalizeOptionalString(value.localPath) ??
+      normalizeOptionalString(value.repositoryUrl);
+    const projectName =
+      normalizeOptionalString(value.projectName) ??
+      localPath ??
+      "local-project";
+    const repositoryUrl =
+      normalizeOptionalString(value.repositoryUrl) ?? localPath ?? projectName;
+
+    if (!sourceId || !localPath) {
+      return null;
+    }
+
+    record = {
+      id:
+        normalizeOptionalString(value.id) ??
+        buildAnalysisHistoryRecordId({
+          sourceType: "local",
+          projectName,
+          sourceId,
+          localPath,
+          repositoryUrl,
+          description,
+        }),
+      sourceType: "local",
+      projectName,
+      sourceId,
+      localPath,
+      repositoryUrl,
+      description,
+      createdAt,
+      updatedAt,
+      fileList,
+      analysisResult: normalizedResult,
+      primaryLanguages,
+      techStack,
+      markdown: "",
+      workLogs,
+    };
+  }
 
   record.markdown =
     typeof value.markdown === "string" && value.markdown.trim()
@@ -390,7 +523,18 @@ function renderFunctionCallNode(
   node: FunctionCallNode,
   depth: number,
   lines: string[],
+  seen: WeakSet<object>,
 ) {
+  if (seen.has(node)) {
+    const indent = "  ".repeat(depth);
+    lines.push(
+      `${indent}- \`${node.name}\` | module: \`${node.moduleId ?? "unassigned"}\` | file: \`${node.filePath ?? "unknown"}\` | shouldDive: ${node.shouldDive}`,
+    );
+    lines.push(`${indent}  summary: [Circular node omitted]`);
+    return;
+  }
+
+  seen.add(node);
   const indent = "  ".repeat(depth);
   lines.push(
     `${indent}- \`${node.name}\` | module: \`${node.moduleId ?? "unassigned"}\` | file: \`${node.filePath ?? "unknown"}\` | shouldDive: ${node.shouldDive}`,
@@ -398,7 +542,7 @@ function renderFunctionCallNode(
   lines.push(`${indent}  summary: ${node.summary}`);
 
   for (const child of node.children) {
-    renderFunctionCallNode(child, depth + 1, lines);
+    renderFunctionCallNode(child, depth + 1, lines, seen);
   }
 }
 
@@ -413,7 +557,7 @@ function renderFunctionCallOverview(overview: FunctionCallOverview | null): stri
     "Call chain:",
   ];
 
-  renderFunctionCallNode(overview.root, 0, lines);
+  renderFunctionCallNode(overview.root, 0, lines, new WeakSet<object>());
   return lines;
 }
 
@@ -436,18 +580,39 @@ function renderStringList(items: string[], emptyText: string): string[] {
   return items.map((item) => `- ${item}`);
 }
 
-export function buildAnalysisHistoryRecordId(repoInfo: {
-  owner: string;
-  repo: string;
-  branch: string;
-}): string {
-  return `${repoInfo.owner}/${repoInfo.repo}@${repoInfo.branch}`;
+function normalizeHistoryIdentitySegment(value: string): string {
+  return value.trim().replace(/\\/g, "/").toLowerCase();
+}
+
+export function buildAnalysisHistoryRecordId(
+  repoInfo: AnalysisHistoryRepoInfo,
+): string {
+  if (repoInfo.sourceType === "github") {
+    return `${repoInfo.owner}/${repoInfo.repo}@${repoInfo.branch}`;
+  }
+
+  return `local:${normalizeHistoryIdentitySegment(
+    repoInfo.localPath || repoInfo.projectName,
+  )}`;
 }
 
 export function buildAnalysisProjectMarkdown(
-  record: Omit<AnalysisHistoryRecord, "markdown">,
+  record: AnalysisHistoryMarkdownRecord,
 ): string {
   const result = record.analysisResult;
+  const basicInfoLines =
+    record.sourceType === "github"
+      ? [
+          `- Source Type: GitHub`,
+          `- Owner: ${record.owner}`,
+          `- Repository: ${record.repo}`,
+          `- Branch: ${record.branch}`,
+        ]
+      : [
+          `- Source Type: Local`,
+          `- Local Path: ${record.localPath}`,
+          `- Snapshot ID: ${record.sourceId}`,
+        ];
   const lines: string[] = [
     "# Project Analysis Workspace File",
     "",
@@ -457,9 +622,7 @@ export function buildAnalysisProjectMarkdown(
     "## Basic Information",
     "",
     `- Project Name: ${record.projectName}`,
-    `- Owner: ${record.owner}`,
-    `- Repository: ${record.repo}`,
-    `- Branch: ${record.branch}`,
+    ...basicInfoLines,
     `- Description: ${record.description ?? "N/A"}`,
     "",
     "## Programming Languages",
@@ -555,12 +718,10 @@ export function createAnalysisHistoryRecord(
   const primaryLanguages = options.analysisResult?.primaryLanguages ?? [];
   const techStack = options.analysisResult?.techStack ?? [];
 
-  const record: AnalysisHistoryRecord = {
+  const baseRecord = {
     id,
-    projectName: options.repoInfo.repo,
-    owner: options.repoInfo.owner,
-    repo: options.repoInfo.repo,
-    branch: options.repoInfo.branch,
+    sourceType: options.repoInfo.sourceType,
+    projectName: options.repoInfo.projectName,
     repositoryUrl: options.repoInfo.repositoryUrl,
     description: options.repoInfo.description,
     createdAt: timestamp,
@@ -571,7 +732,23 @@ export function createAnalysisHistoryRecord(
     techStack,
     markdown: "",
     workLogs: options.workLogs,
-  };
+  } as const;
+
+  const record: AnalysisHistoryRecord =
+    options.repoInfo.sourceType === "github"
+      ? {
+          ...baseRecord,
+          sourceType: "github",
+          owner: options.repoInfo.owner,
+          repo: options.repoInfo.repo,
+          branch: options.repoInfo.branch,
+        }
+      : {
+          ...baseRecord,
+          sourceType: "local",
+          sourceId: options.repoInfo.sourceId,
+          localPath: options.repoInfo.localPath,
+        };
 
   record.markdown = buildAnalysisProjectMarkdown(record);
   return record;
@@ -649,80 +826,4 @@ export function upsertAnalysisHistoryRecord(
   ].slice(0, MAX_HISTORY_RECORDS);
 
   return writeRecords(merged);
-}
-
-export function flattenFileTreePaths(nodes: FileNode[]): string[] {
-  const filePaths: string[] = [];
-
-  const visit = (items: FileNode[]) => {
-    for (const node of items) {
-      if (node.type === "file") {
-        filePaths.push(node.path);
-        continue;
-      }
-
-      if (node.children) {
-        visit(node.children);
-      }
-    }
-  };
-
-  visit(nodes);
-  return normalizeFileList(filePaths);
-}
-
-export function createFileTreeFromFileList(fileList: string[]): FileNode[] {
-  const root: FileNode[] = [];
-  const nodeMap = new Map<string, FileNode>();
-
-  for (const path of normalizeFileList(fileList)) {
-    const parts = path.split("/").filter(Boolean);
-    let parentPath = "";
-
-    for (const [index, segment] of parts.entries()) {
-      const currentPath = parentPath ? `${parentPath}/${segment}` : segment;
-      const isFile = index === parts.length - 1;
-      const existing = nodeMap.get(currentPath);
-
-      if (!existing) {
-        const node: FileNode = {
-          name: segment,
-          path: currentPath,
-          type: isFile ? "file" : "folder",
-          children: isFile ? undefined : [],
-        };
-        nodeMap.set(currentPath, node);
-
-        if (!parentPath) {
-          root.push(node);
-        } else {
-          const parent = nodeMap.get(parentPath);
-          if (parent?.children) {
-            parent.children.push(node);
-          }
-        }
-      }
-
-      parentPath = currentPath;
-    }
-  }
-
-  const sortNodes = (items: FileNode[]) => {
-    items.sort((a, b) => {
-      if (a.type !== b.type) {
-        return a.type === "folder" ? -1 : 1;
-      }
-
-      return a.name.localeCompare(b.name);
-    });
-
-    for (const node of items) {
-      if (node.children) {
-        sortNodes(node.children);
-      }
-    }
-  };
-
-  sortNodes(root);
-  return root;
 }

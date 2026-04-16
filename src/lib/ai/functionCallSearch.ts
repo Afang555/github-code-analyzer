@@ -321,6 +321,45 @@ function findBraceBlockEnd(source: string, openBraceIndex: number): number | nul
   return null;
 }
 
+function extractSingleSnippetWithoutBraceExpansion(
+  lines: string[],
+  startLineIndex: number,
+): string {
+  const actualStartLineIndex = getLeadingDecoratedStart(lines, startLineIndex);
+  let endLineIndex = startLineIndex;
+  let openParens = 0;
+  let seenContent = false;
+
+  for (let index = startLineIndex; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (!trimmed && seenContent) {
+      break;
+    }
+
+    if (trimmed) {
+      seenContent = true;
+    }
+
+    for (const char of line) {
+      if (char === "(") {
+        openParens += 1;
+      } else if (char === ")") {
+        openParens = Math.max(0, openParens - 1);
+      }
+    }
+
+    endLineIndex = index;
+
+    if (openParens === 0 && /[;{]$/.test(trimmed)) {
+      break;
+    }
+  }
+
+  return lines.slice(actualStartLineIndex, endLineIndex + 1).join("\n");
+}
+
 function extractBraceSnippet(lines: string[], startLineIndex: number): string {
   const actualStartLineIndex = getLeadingDecoratedStart(lines, startLineIndex);
   const source = lines.join("\n");
@@ -329,13 +368,13 @@ function extractBraceSnippet(lines: string[], startLineIndex: number): string {
   const openBraceIndex = source.indexOf("{", startOffset);
 
   if (openBraceIndex === -1) {
-    return extractSingleSnippet(lines, actualStartLineIndex);
+    return extractSingleSnippetWithoutBraceExpansion(lines, actualStartLineIndex);
   }
 
   const closeBraceIndex = findBraceBlockEnd(source, openBraceIndex);
 
   if (closeBraceIndex === null) {
-    return extractSingleSnippet(lines, actualStartLineIndex);
+    return extractSingleSnippetWithoutBraceExpansion(lines, actualStartLineIndex);
   }
 
   const endLineIndex = findLineIndexFromOffset(offsets, closeBraceIndex);
@@ -365,13 +404,16 @@ function extractIndentedSnippet(lines: string[], startLineIndex: number): string
 }
 
 function extractSingleSnippet(lines: string[], startLineIndex: number): string {
+  const fallbackSnippet = extractSingleSnippetWithoutBraceExpansion(
+    lines,
+    startLineIndex,
+  );
   const actualStartLineIndex = getLeadingDecoratedStart(lines, startLineIndex);
-  let endLineIndex = startLineIndex;
   let openParens = 0;
   let seenContent = false;
 
   for (let index = startLineIndex; index < lines.length; index += 1) {
-    const line = lines[index];
+    const line = lines[index] ?? "";
     const trimmed = line.trim();
 
     if (!trimmed && seenContent) {
@@ -390,8 +432,6 @@ function extractSingleSnippet(lines: string[], startLineIndex: number): string {
       }
     }
 
-    endLineIndex = index;
-
     if (trimmed.includes("{")) {
       return extractBraceSnippet(lines, actualStartLineIndex);
     }
@@ -401,7 +441,7 @@ function extractSingleSnippet(lines: string[], startLineIndex: number): string {
     }
   }
 
-  return lines.slice(actualStartLineIndex, endLineIndex + 1).join("\n");
+  return fallbackSnippet;
 }
 
 function parseFunctionSearchName(name: string): ParsedFunctionSearchName | null {

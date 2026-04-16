@@ -1,5 +1,7 @@
 import "server-only";
 
+import { createHash } from "node:crypto";
+
 import type { FileNode, GitHubNode, GitHubRepositoryInfo } from "@/types/github";
 
 const GITHUB_API_BASE = "https://api.github.com";
@@ -44,6 +46,7 @@ type GitHubErrorOptions = {
   conflictMessage?: string;
   apiMessage?: string | null;
   responseHeaders?: Headers;
+  tokenConfigured?: boolean;
 };
 
 type GitHubRateLimitInfo = {
@@ -51,6 +54,10 @@ type GitHubRateLimitInfo = {
   remaining: number | null;
   resetAt: string | null;
   tokenConfigured: boolean;
+};
+
+type GitHubRequestOptions = {
+  githubToken?: string | null;
 };
 
 const repoInfoCache = new Map<string, CacheEntry<GitHubRepositoryInfo>>();
@@ -67,24 +74,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function getGitHubToken(): string | null {
+function getEnvironmentGitHubToken(): string | null {
   const token =
     process.env.GITHUB_TOKEN?.trim() || process.env.GITHUB_API_TOKEN?.trim();
 
   return token || null;
 }
 
-function hasGitHubToken(): boolean {
-  return Boolean(getGitHubToken());
+function resolveGitHubToken(options?: GitHubRequestOptions): string | null {
+  return getEnvironmentGitHubToken() ?? options?.githubToken?.trim() ?? null;
 }
 
-function createGitHubHeaders(accept: string): HeadersInit {
+function createGitHubHeaders(
+  accept: string,
+  options?: GitHubRequestOptions,
+): HeadersInit {
   const headers: Record<string, string> = {
     Accept: accept,
     "X-GitHub-Api-Version": GITHUB_API_VERSION,
     "User-Agent": GITHUB_USER_AGENT,
   };
-  const token = getGitHubToken();
+  const token = resolveGitHubToken(options);
 
   if (token) {
     headers.Authorization = `Bearer ${token}`;
@@ -112,7 +122,10 @@ function formatRateLimitReset(resetUnixSeconds: number | null): string | null {
   });
 }
 
-function extractRateLimitInfo(headers?: Headers): GitHubRateLimitInfo | null {
+function extractRateLimitInfo(
+  headers: Headers | undefined,
+  tokenConfigured: boolean,
+): GitHubRateLimitInfo | null {
   if (!headers) {
     return null;
   }
@@ -131,7 +144,7 @@ function extractRateLimitInfo(headers?: Headers): GitHubRateLimitInfo | null {
     limit,
     remaining,
     resetAt,
-    tokenConfigured: hasGitHubToken(),
+    tokenConfigured,
   };
 }
 
@@ -183,6 +196,7 @@ function createGitHubHttpErrorMessage({
   conflictMessage,
   apiMessage,
   responseHeaders,
+  tokenConfigured,
 }: GitHubErrorOptions): string {
   if (status === 404) {
     return notFoundMessage;
@@ -193,7 +207,9 @@ function createGitHubHttpErrorMessage({
   }
 
   if (status === 403 || status === 429) {
-    return buildRateLimitMessage(extractRateLimitInfo(responseHeaders));
+    return buildRateLimitMessage(
+      extractRateLimitInfo(responseHeaders, Boolean(tokenConfigured)),
+    );
   }
 
   if (status === 409 && conflictMessage) {
@@ -232,10 +248,14 @@ async function fetchGitHubJson<T>(
     fallbackPrefix: string;
     notFoundMessage: string;
     conflictMessage?: string;
-  },
+  } & GitHubRequestOptions,
 ): Promise<T> {
+  const tokenConfigured = Boolean(resolveGitHubToken(options));
   const response = await fetchWithNetworkContext(url, {
-    headers: createGitHubHeaders(options.accept ?? "application/vnd.github+json"),
+    headers: createGitHubHeaders(
+      options.accept ?? "application/vnd.github+json",
+      options,
+    ),
   });
 
   if (!response.ok) {
@@ -250,6 +270,7 @@ async function fetchGitHubJson<T>(
         conflictMessage: options.conflictMessage,
         apiMessage,
         responseHeaders: response.headers,
+        tokenConfigured,
       }),
     );
   }
@@ -263,10 +284,14 @@ async function fetchGitHubText(
     accept?: string;
     fallbackPrefix: string;
     notFoundMessage: string;
-  },
+  } & GitHubRequestOptions,
 ): Promise<string> {
+  const tokenConfigured = Boolean(resolveGitHubToken(options));
   const response = await fetchWithNetworkContext(url, {
-    headers: createGitHubHeaders(options.accept ?? "application/vnd.github.raw"),
+    headers: createGitHubHeaders(
+      options.accept ?? "application/vnd.github.raw",
+      options,
+    ),
   });
 
   if (!response.ok) {
@@ -280,6 +305,7 @@ async function fetchGitHubText(
         notFoundMessage: options.notFoundMessage,
         apiMessage,
         responseHeaders: response.headers,
+        tokenConfigured,
       }),
     );
   }
@@ -304,11 +330,13 @@ async function fetchContentViaContentsApi(
   repo: string,
   branch: string,
   path: string,
+  options?: GitHubRequestOptions,
 ): Promise<string> {
   const url = `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${encodeGitHubPath(path)}?ref=${encodeURIComponent(branch)}`;
   const payload = await fetchGitHubJson<Record<string, unknown>>(url, {
     fallbackPrefix: TEXT.fileContentFailedPrefix,
     notFoundMessage: TEXT.fileNotFound,
+    githubToken: options?.githubToken,
   });
 
   if (payload.type !== "file") {
@@ -330,12 +358,14 @@ async function fetchContentViaRawContentsApi(
   repo: string,
   branch: string,
   path: string,
+  options?: GitHubRequestOptions,
 ): Promise<string> {
   const url = `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${encodeGitHubPath(path)}?ref=${encodeURIComponent(branch)}`;
 
   return fetchGitHubText(url, {
     fallbackPrefix: TEXT.fileContentFailedPrefix,
     notFoundMessage: TEXT.fileNotFound,
+    githubToken: options?.githubToken,
   });
 }
 
@@ -344,11 +374,14 @@ async function fetchContentViaRawGitHub(
   repo: string,
   branch: string,
   path: string,
+  options?: GitHubRequestOptions,
 ): Promise<string> {
   const url = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
+  const token = resolveGitHubToken(options);
   const response = await fetchWithNetworkContext(url, {
     headers: {
       "User-Agent": GITHUB_USER_AGENT,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
   });
 
@@ -360,6 +393,7 @@ async function fetchContentViaRawGitHub(
         fallbackPrefix: TEXT.fileContentFailedPrefix,
         notFoundMessage: TEXT.fileNotFound,
         responseHeaders: response.headers,
+        tokenConfigured: Boolean(token),
       }),
     );
   }
@@ -429,6 +463,16 @@ function getCacheKey(parts: string[]): string {
   return parts.join("::");
 }
 
+function getAuthCacheKeyPart(options?: GitHubRequestOptions): string {
+  const token = resolveGitHubToken(options);
+
+  if (!token) {
+    return "public";
+  }
+
+  return `auth:${createHash("sha256").update(token).digest("hex").slice(0, 12)}`;
+}
+
 function getCachedValue<T>(
   cache: Map<string, CacheEntry<T>>,
   key: string,
@@ -461,10 +505,11 @@ function getCachedValue<T>(
 export async function getRepositoryInfo(
   owner: string,
   repo: string,
+  options?: GitHubRequestOptions,
 ): Promise<GitHubRepositoryInfo> {
   return getCachedValue(
     repoInfoCache,
-    getCacheKey([owner, repo]),
+    getCacheKey([owner, repo, getAuthCacheKeyPart(options)]),
     REPO_INFO_CACHE_TTL_MS,
     () =>
       fetchGitHubJson<GitHubRepositoryInfo>(
@@ -472,6 +517,7 @@ export async function getRepositoryInfo(
         {
           fallbackPrefix: TEXT.repoInfoFailedPrefix,
           notFoundMessage: TEXT.repoNotFound,
+          githubToken: options?.githubToken,
         },
       ),
   );
@@ -481,10 +527,11 @@ export async function getRepositoryTree(
   owner: string,
   repo: string,
   branch: string,
+  options?: GitHubRequestOptions,
 ): Promise<FileNode[]> {
   return getCachedValue(
     repoTreeCache,
-    getCacheKey([owner, repo, branch]),
+    getCacheKey([owner, repo, branch, getAuthCacheKeyPart(options)]),
     REPO_TREE_CACHE_TTL_MS,
     async () => {
       const payload = await fetchGitHubJson<{
@@ -496,6 +543,7 @@ export async function getRepositoryTree(
           fallbackPrefix: TEXT.repoTreeFailedPrefix,
           notFoundMessage: TEXT.repoNotFound,
           conflictMessage: TEXT.repoTreeConflict,
+          githubToken: options?.githubToken,
         },
       );
 
@@ -515,19 +563,21 @@ export async function getFileContent(
   repo: string,
   branch: string,
   path: string,
+  options?: GitHubRequestOptions,
 ): Promise<string> {
   const attempts: Array<{ source: string; load: () => Promise<string> }> = [
     {
       source: TEXT.contentsApi,
-      load: () => fetchContentViaContentsApi(owner, repo, branch, path),
+      load: () => fetchContentViaContentsApi(owner, repo, branch, path, options),
     },
     {
       source: TEXT.rawContentsApi,
-      load: () => fetchContentViaRawContentsApi(owner, repo, branch, path),
+      load: () =>
+        fetchContentViaRawContentsApi(owner, repo, branch, path, options),
     },
     {
       source: TEXT.rawGitHub,
-      load: () => fetchContentViaRawGitHub(owner, repo, branch, path),
+      load: () => fetchContentViaRawGitHub(owner, repo, branch, path, options),
     },
   ];
   const errors: string[] = [];
