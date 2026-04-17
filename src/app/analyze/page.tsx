@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import {
   Suspense,
@@ -774,7 +774,7 @@ function AnalyzePageContent() {
             : TEXT.entryReviewNoneConfirmed,
       message:
         reviewedCount > 0
-          ? `已完成 ${reviewedCount} 个候选入口文件复核，但未确认真实入口。${
+          ? `已完成 ${reviewedCount} 个候选入口复核，但未确认真实入口。${
               readFileFailureCount > 0
                 ? ` 另有 ${readFileFailureCount} 个候选文件读取失败。`
                 : ""
@@ -1109,6 +1109,7 @@ function AnalyzePageContent() {
             : TEXT.aiConfigCheck;
 
         setAiError(errorMessage);
+
         appendLog({
           level: "error",
           title: TEXT.aiFailed,
@@ -1221,7 +1222,7 @@ function AnalyzePageContent() {
   const analyzeLocalRepository = async (sourceId: string) => {
     shouldPersistHistoryRef.current = true;
     autoLoadedHistoryRef.current = null;
-    startLogSession("本地项目");
+    startLogSession("鏈湴椤圭洰");
 
     try {
       await loadRepositoryAndAnalyze(
@@ -1429,10 +1430,20 @@ function AnalyzePageContent() {
     appendLog({
       level: "info",
       title: "手动下钻",
-      message: `函数：${targetNode.name}\n文件：${targetNode.filePath ?? TEXT.unknownFunctionFile}\n策略：仅下钻一层`,
+      message: `函数：${targetNode.name}\n文件：${
+        targetNode.filePath ?? TEXT.unknownFunctionFile
+      }\n策略：仅下钻一层`,
     });
 
     try {
+      const drillDownRequestMeta = {
+        nodePath,
+        sourceType: repoInfo.sourceType,
+        projectName: repoInfo.projectName,
+        filePathCount: filePaths.length,
+        model: appSettings.aiModel,
+      };
+
       const res = await fetch("/api/analyze-repo/drill-down", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1454,10 +1465,23 @@ function AnalyzePageContent() {
             ? data.error
             : TEXT.aiConfigCheck;
 
+        console.error("Manual drill-down API returned error status:", {
+          request: drillDownRequestMeta,
+          status: res.status,
+          statusText: res.statusText,
+          payload: data,
+        });
+
         appendLog({
           level: "error",
           title: "手动下钻失败",
           message,
+          requestPayload: drillDownRequestMeta,
+          responsePayload: {
+            status: res.status,
+            statusText: res.statusText,
+            payload: data,
+          },
         });
 
         if (isAnalyzeRepoDrillDownErrorResponse(data)) {
@@ -1471,10 +1495,23 @@ function AnalyzePageContent() {
       }
 
       if (!isAnalyzeRepoDrillDownSuccessResponse(data)) {
+        console.error("Manual drill-down returned invalid success payload:", {
+          request: drillDownRequestMeta,
+          status: res.status,
+          statusText: res.statusText,
+          payload: data,
+        });
+
         appendLog({
           level: "error",
           title: "手动下钻失败",
           message: TEXT.invalidAiResponse,
+          requestPayload: drillDownRequestMeta,
+          responsePayload: {
+            status: res.status,
+            statusText: res.statusText,
+            payload: data,
+          },
         });
         return;
       }
@@ -1490,7 +1527,14 @@ function AnalyzePageContent() {
         persistHistorySnapshot(data.result, workLogs);
       }
     } catch (error) {
-      console.error("Manual drill-down failed:", error);
+      console.error("Manual drill-down failed:", {
+        error,
+        nodePath,
+        sourceType: repoInfo.sourceType,
+        projectName: repoInfo.projectName,
+        filePathCount: filePaths.length,
+        model: appSettings.aiModel,
+      });
       appendLog({
         level: "error",
         title: "手动下钻失败",
@@ -1967,7 +2011,7 @@ function AnalyzePageContent() {
           {repoInfo && (
             <div className="mt-auto border-t border-gray-200 px-4 py-2 dark:border-gray-800">
               <div className="mb-1 text-xs text-gray-500 dark:text-gray-400">
-                {repoInfo.sourceType === "github" ? TEXT.currentRepo : "当前项目"}
+                {repoInfo.sourceType === "github" ? TEXT.currentRepo : "褰撳墠椤圭洰"}
               </div>
               <div
                 className="truncate text-sm font-medium"
@@ -2168,3 +2212,4 @@ export default function AnalyzePage() {
     </Suspense>
   );
 }
+

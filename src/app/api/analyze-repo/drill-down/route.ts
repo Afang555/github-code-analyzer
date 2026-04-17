@@ -5,9 +5,9 @@ import {
   AIAnalysisServiceError,
   drillDownFunctionOverviewNode,
 } from "@/lib/ai/openaiCompatible";
-import { createJsonPreview } from "@/lib/jsonPreview";
 import {
   normalizeAIAnalysisResult,
+  type FunctionCallAnalysisDebugData,
   type AIAnalysisResult,
 } from "@/types/aiAnalysis";
 import { normalizeRepositoryContext } from "@/types/repository";
@@ -40,7 +40,47 @@ function isValidNodePath(value: unknown): value is number[] {
   );
 }
 
+function createTraceId(): string {
+  return `manual-drill-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+}
+
+function stringifyLogPayload(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeModelAttempts(debug: FunctionCallAnalysisDebugData | null): unknown[] {
+  const attempts = debug?.model?.attempts ?? [];
+
+  return attempts.map((attempt, index) => ({
+    index,
+    mode: attempt.mode,
+    ok: attempt.ok,
+    status: attempt.status,
+    requestKeys:
+      attempt.request && typeof attempt.request === "object"
+        ? Object.keys(attempt.request as Record<string, unknown>)
+        : [],
+    responseType: Array.isArray(attempt.response)
+      ? "array"
+      : attempt.response === null
+        ? "null"
+        : typeof attempt.response,
+    response:
+      typeof attempt.response === "string"
+        ? attempt.response
+        : attempt.response ?? null,
+  }));
+}
+
 export async function POST(req: Request) {
+  const traceId = createTraceId();
+
   try {
     const body = (await req.json()) as Record<string, unknown>;
     const filePaths = body.filePaths;
@@ -108,14 +148,47 @@ export async function POST(req: Request) {
       settings,
     });
 
+    if (outcome.debug.status !== "completed") {
+      console.error(
+        `[Manual Drill-Down][${traceId}] Non-completed outcome\n${stringifyLogPayload(
+          {
+            status: outcome.debug.status,
+            message: outcome.debug.message,
+            targetEntryPoint: outcome.debug.targetEntryPoint,
+            readmePath: outcome.debug.readmePath,
+            nodePath: normalizedNodePath,
+            modelAttempts: summarizeModelAttempts(outcome.debug),
+            drillDownAttempts: outcome.debug.drillDownAttempts,
+            cacheEvents: outcome.debug.cacheEvents,
+            fullDebug: outcome.debug,
+          },
+        )}`,
+      );
+    }
+
     return NextResponse.json({
       result: outcome.result,
       debug: {
-        functionOverview: createJsonPreview(outcome.debug),
+        functionOverview: outcome.debug,
       },
     });
   } catch (error: unknown) {
-    console.error("Manual Drill-Down Error:", error);
+    console.error(
+      `[Manual Drill-Down][${traceId}] Route error\n${stringifyLogPayload({
+        error:
+          error instanceof Error
+            ? {
+                name: error.name,
+                message: error.message,
+                stack: error.stack,
+              }
+            : error,
+        debug:
+          error instanceof AIAnalysisServiceError
+            ? error.debug?.functionOverview ?? null
+            : null,
+      })}`,
+    );
 
     const message =
       error instanceof Error ? error.message : TEXT.drillDownFailed;
@@ -126,9 +199,7 @@ export async function POST(req: Request) {
         debug:
           error instanceof AIAnalysisServiceError && error.debug?.functionOverview
             ? {
-                functionOverview: createJsonPreview(
-                  error.debug.functionOverview,
-                ),
+                functionOverview: error.debug.functionOverview,
               }
             : undefined,
       },
